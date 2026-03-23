@@ -73,7 +73,7 @@ def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
         cur = conn.execute(sql, params)
         rows = cur.fetchall()
 
-    return [r["image_name"] for r in rows]
+    return [r["image_name"].replace(".jpg", ".webp") for r in rows]
 
 
 def network_person_id_to_name() -> dict[str, str | None]:
