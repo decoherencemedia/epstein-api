@@ -1,0 +1,26 @@
+[project]
+name = "epstein-api"
+version = "0.0.1"
+requires-python = ">=3.12"
+dependencies = [
+    "flask",
+    "flask-cors",
+    "flask-caching",
+    "gunicorn",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-flask",
+    "pytest-cov",
+    "pytest-html",
+]
+
+[tool.uv]
+package = false
+default-groups = "all"
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
