@@ -49,6 +49,9 @@ def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
     """
     Return one object per image: each image contains every requested person_id at least once.
 
+    ``faces`` includes bounding boxes for *every* person present in that image (not only the
+    query person_ids), still one box per person per image (lowest ``face_id`` if multiple rows).
+
     Each item is {"image": "<filename>.webp", "faces": {person_id: {left, top, width, height}}}
     with bbox coordinates Rekognition-normalized (0..1).
     """
@@ -58,7 +61,7 @@ def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
         return []
 
     placeholders_in = ",".join("?" * n)
-    # Params: first IN (n) + HAVING (1) + second IN (n) = 2n + 1
+    # Params: IN (n) for qualifying + HAVING (1) = n + 1
     sql = f"""
         WITH qualifying AS (
             SELECT f.image_name
@@ -84,7 +87,8 @@ def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
             FROM faces AS f
             INNER JOIN images AS i ON i.image_name = f.image_name
             INNER JOIN qualifying AS q ON q.image_name = f.image_name
-            WHERE f.person_id IN ({placeholders_in})
+            WHERE f.person_id IS NOT NULL
+                AND TRIM(f.person_id) != ''
                 AND i.duplicate_of IS NULL
         )
         SELECT image_name, person_id, left, top, width, height
@@ -93,7 +97,7 @@ def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
         ORDER BY image_name, person_id;
     """
 
-    params = tuple(unique) + (n,) + tuple(unique)
+    params = tuple(unique) + (n,)
 
     with get_db_connection() as conn:
         cur = conn.execute(sql, params)
@@ -147,7 +151,8 @@ def get_photos_by_people():
     """
     Query: person_ids — comma-separated list, e.g. /photos?person_ids=person_1,person_2
     Returns images where every listed person appears on the same image (at least one face each).
-    Each element is {"image": "<file>.webp", "faces": {person_id: {left, top, width, height}}}.
+    Each element is {"image": "<file>.webp", "faces": {...}} with bboxes for *all* people in
+    that image (not only the queried ids).
     """
     raw = request.args.get("person_ids", "").strip()
     if not raw:
