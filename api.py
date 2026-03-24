@@ -47,8 +47,10 @@ def description():
 
 def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
     """
-    Return image rows for images that contain at least one face for every person_id
-    (join faces + images; GROUP BY image; HAVING COUNT(DISTINCT person_id) = N).
+    Return one object per image: each image contains every requested person_id at least once.
+
+    Each item is {"image": "<filename>.webp", "faces": {person_id: {left, top, width, height}}}
+    with bbox coordinates Rekognition-normalized (0..1).
     """
     unique = sorted(set(p for p in person_ids if p and str(p).strip()))
     n = len(unique)
@@ -56,24 +58,66 @@ def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
         return []
 
     placeholders_in = ",".join("?" * n)
-    # Second parameter to HAVING is n (must match distinct requested ids present on image).
+    # Params: first IN (n) + HAVING (1) + second IN (n) = 2n + 1
     sql = f"""
-        SELECT i.image_name
-        FROM faces AS f
-        INNER JOIN images AS i ON i.image_name = f.image_name
-        WHERE f.person_id IN ({placeholders_in})
-          AND i.duplicate_of IS NULL
-        GROUP BY f.image_name
-        HAVING COUNT(DISTINCT f.person_id) = ?
-        ORDER BY f.image_name
+        WITH qualifying AS (
+            SELECT f.image_name
+            FROM faces AS f
+            INNER JOIN images AS i ON i.image_name = f.image_name
+            WHERE f.person_id IN ({placeholders_in})
+                AND i.duplicate_of IS NULL
+            GROUP BY f.image_name
+            HAVING COUNT(DISTINCT f.person_id) = ?
+        ),
+        ranked AS (
+            SELECT
+                f.image_name,
+                f.person_id,
+                f.left,
+                f.top,
+                f.width,
+                f.height,
+                ROW_NUMBER() OVER (
+                    PARTITION BY f.image_name, f.person_id
+                    ORDER BY f.face_id
+                ) AS rn
+            FROM faces AS f
+            INNER JOIN images AS i ON i.image_name = f.image_name
+            INNER JOIN qualifying AS q ON q.image_name = f.image_name
+            WHERE f.person_id IN ({placeholders_in})
+                AND i.duplicate_of IS NULL
+        )
+        SELECT image_name, person_id, left, top, width, height
+        FROM ranked
+        WHERE rn = 1
+        ORDER BY image_name, person_id;
     """
-    params = tuple(unique) + (n,)
+
+    params = tuple(unique) + (n,) + tuple(unique)
 
     with get_db_connection() as conn:
         cur = conn.execute(sql, params)
         rows = cur.fetchall()
 
-    return [r["image_name"].replace(".jpg", ".webp") for r in rows]
+    order: list[str] = []
+    by_image: dict[str, dict] = {}
+    for r in rows:
+        webp = r["image_name"].replace(".jpg", ".webp")
+        if webp not in by_image:
+            by_image[webp] = {
+                "image": webp,
+                "faces": {},
+            }
+            order.append(webp)
+        pid = r["person_id"]
+        by_image[webp]["faces"][pid] = {
+            "left": float(r["left"]),
+            "top": float(r["top"]),
+            "width": float(r["width"]),
+            "height": float(r["height"]),
+        }
+
+    return [by_image[k] for k in order]
 
 
 def network_person_id_to_name() -> dict[str, str | None]:
@@ -103,6 +147,7 @@ def get_photos_by_people():
     """
     Query: person_ids — comma-separated list, e.g. /photos?person_ids=person_1,person_2
     Returns images where every listed person appears on the same image (at least one face each).
+    Each element is {"image": "<file>.webp", "faces": {person_id: {left, top, width, height}}}.
     """
     raw = request.args.get("person_ids", "").strip()
     if not raw:
