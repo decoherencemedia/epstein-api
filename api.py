@@ -59,6 +59,7 @@ def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
     n = len(unique)
     if n == 0:
         return []
+    max_images = 1000
 
     placeholders_in = ",".join("?" * n)
     # Params: IN (n) for qualifying + HAVING (1) = n + 1
@@ -69,6 +70,7 @@ def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
             INNER JOIN images AS i ON i.image_name = f.image_name
             WHERE f.person_id IN ({placeholders_in})
                 AND i.duplicate_of IS NULL
+                AND COALESCE(i.is_explicit, 0) = 0
             GROUP BY f.image_name
             HAVING COUNT(DISTINCT f.person_id) = ?
         ),
@@ -90,13 +92,13 @@ def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
             WHERE f.person_id IS NOT NULL
                 AND TRIM(f.person_id) != ''
                 AND i.duplicate_of IS NULL
+                AND COALESCE(i.is_explicit, 0) = 0
         )
         SELECT image_name, person_id, left, top, width, height
         FROM ranked
         WHERE rn = 1
         ORDER BY image_name, person_id;
     """
-
     params = tuple(unique) + (n,)
 
     with get_db_connection() as conn:
@@ -108,6 +110,8 @@ def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
     for r in rows:
         webp = r["image_name"].replace(".jpg", ".webp")
         if webp not in by_image:
+            if len(order) >= max_images:
+                break
             by_image[webp] = {
                 "image": webp,
                 "faces": {},
