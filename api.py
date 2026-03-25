@@ -49,11 +49,13 @@ def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
     """
     Return one object per image: each image contains every requested person_id at least once.
 
-    ``faces`` includes bounding boxes for *every* person present in that image (not only the
-    query person_ids), still one box per person per image (lowest ``face_id`` if multiple rows).
+    ``faces`` is a list of every face row in that image (all ``person_id`` values), including
+    multiple boxes for the same person when they appear more than once. Each element is::
 
-    Each item is {"image": "<filename>.webp", "faces": {person_id: {left, top, width, height}}}
-    with bbox coordinates Rekognition-normalized (0..1).
+        {"face_id": str, "person_id": str, "left", "top", "width", "height"}
+
+    Coordinates are Rekognition-normalized (0..1). Matches ``normalizeFaceEntries`` in
+    ``site/pages/people-inner.html``.
     """
     unique = sorted(set(p for p in person_ids if p and str(p).strip()))
     n = len(unique)
@@ -73,31 +75,23 @@ def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
                 AND COALESCE(i.is_explicit, 0) = 0
             GROUP BY f.image_name
             HAVING COUNT(DISTINCT f.person_id) = ?
-        ),
-        ranked AS (
-            SELECT
-                f.image_name,
-                f.person_id,
-                f.left,
-                f.top,
-                f.width,
-                f.height,
-                ROW_NUMBER() OVER (
-                    PARTITION BY f.image_name, f.person_id
-                    ORDER BY f.face_id
-                ) AS rn
-            FROM faces AS f
-            INNER JOIN images AS i ON i.image_name = f.image_name
-            INNER JOIN qualifying AS q ON q.image_name = f.image_name
-            WHERE f.person_id IS NOT NULL
-                AND TRIM(f.person_id) != ''
-                AND i.duplicate_of IS NULL
-                AND COALESCE(i.is_explicit, 0) = 0
         )
-        SELECT image_name, person_id, left, top, width, height
-        FROM ranked
-        WHERE rn = 1
-        ORDER BY image_name, person_id;
+        SELECT
+            f.image_name,
+            f.face_id,
+            f.person_id,
+            f.left,
+            f.top,
+            f.width,
+            f.height
+        FROM faces AS f
+        INNER JOIN images AS i ON i.image_name = f.image_name
+        INNER JOIN qualifying AS q ON q.image_name = f.image_name
+        WHERE f.person_id IS NOT NULL
+            AND TRIM(f.person_id) != ''
+            AND i.duplicate_of IS NULL
+            AND COALESCE(i.is_explicit, 0) = 0
+        ORDER BY f.image_name, f.person_id, f.face_id;
     """
     params = tuple(unique) + (n,)
 
@@ -114,16 +108,20 @@ def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
                 break
             by_image[webp] = {
                 "image": webp,
-                "faces": {},
+                "faces": [],
             }
             order.append(webp)
         pid = r["person_id"]
-        by_image[webp]["faces"][pid] = {
-            "left": float(r["left"]),
-            "top": float(r["top"]),
-            "width": float(r["width"]),
-            "height": float(r["height"]),
-        }
+        by_image[webp]["faces"].append(
+            {
+                "face_id": r["face_id"],
+                "person_id": pid,
+                "left": float(r["left"]),
+                "top": float(r["top"]),
+                "width": float(r["width"]),
+                "height": float(r["height"]),
+            }
+        )
 
     return [by_image[k] for k in order]
 
@@ -155,8 +153,8 @@ def get_photos_by_people():
     """
     Query: person_ids — comma-separated list, e.g. /photos?person_ids=person_1,person_2
     Returns images where every listed person appears on the same image (at least one face each).
-    Each element is {"image": "<file>.webp", "faces": {...}} with bboxes for *all* people in
-    that image (not only the queried ids).
+    Each element is {"image": "<file>.webp", "faces": [ {...}, ... ]} — one object per face
+    row in the DB for that image (including multiple appearances of the same person).
     """
     raw = request.args.get("person_ids", "").strip()
     if not raw:
