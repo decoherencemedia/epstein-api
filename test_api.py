@@ -16,7 +16,7 @@ def test_description(client):
 def test_photos_single(client):
     response = client.get("/photos?person_ids=person_49")
     assert response.status_code == 200
-    assert len(response.json["data"]) == 334
+    assert len(response.json["data"]) == 332
     assert "EFTA00254398-00069.webp" in [image["image"] for image in response.json["data"]]
 
 def test_photos_double(client):

@@ -73,6 +73,7 @@ def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
             WHERE f.person_id IN ({placeholders_in})
                 AND i.duplicate_of IS NULL
                 AND COALESCE(i.is_explicit, 0) = 0
+                AND COALESCE(i.contains_victim, 0) = 0
             GROUP BY f.image_name
             HAVING COUNT(DISTINCT f.person_id) = ?
         )
@@ -91,6 +92,7 @@ def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
             AND TRIM(f.person_id) != ''
             AND i.duplicate_of IS NULL
             AND COALESCE(i.is_explicit, 0) = 0
+            AND COALESCE(i.contains_victim, 0) = 0
         ORDER BY f.image_name, f.person_id, f.face_id;
     """
     params = tuple(unique) + (n,)
@@ -127,7 +129,11 @@ def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
 
 
 def network_person_id_to_name() -> dict[str, str | None]:
-    """person_id -> name for people included in the network (include_in_network = 1)."""
+    """
+    person_id -> display name for people included in the network (include_in_network = 1).
+
+    Victims have anonymized names in SQLite (``Victim 1``, …) from sheet sync, not real names.
+    """
     sql = """
         SELECT person_id, name
         FROM people
