@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -128,6 +129,83 @@ def photos_for_all_person_ids(person_ids: list[str]) -> list[dict]:
     return [by_image[k] for k in order]
 
 
+def _validate_document_prefix(raw: str) -> str | None:
+    """
+    Document stem prefix for image_name (e.g. EFTA00000005 matches EFTA00000005-00001.webp).
+    Must be literal ``EFTA`` (case-insensitive) followed by exactly 8 digits. Normalized to ``EFTA`` + digits.
+    """
+    p = raw.strip()
+    if not p:
+        return None
+    m = re.fullmatch(r"(?i)efta(\d{8})", p)
+    if not m:
+        return None
+    return "EFTA" + m.group(1)
+
+
+def photos_for_document_prefix(prefix: str) -> list[dict]:
+    """
+    Return one object per image whose ``image_name`` starts with ``prefix`` (same filters as
+    ``photos_for_all_person_ids``: non-duplicate, non-explicit, no victim images).
+    """
+    unique_prefix = _validate_document_prefix(prefix)
+    if unique_prefix is None:
+        return []
+
+    max_images = 1000
+    pattern = unique_prefix + "%"
+
+    sql = """
+        SELECT
+            f.image_name,
+            f.face_id,
+            f.person_id,
+            f.left,
+            f.top,
+            f.width,
+            f.height
+        FROM faces AS f
+        INNER JOIN images AS i ON i.image_name = f.image_name
+        WHERE f.image_name LIKE ?
+            AND f.person_id IS NOT NULL
+            AND TRIM(f.person_id) != ''
+            AND i.duplicate_of IS NULL
+            AND COALESCE(i.is_explicit, 0) = 0
+            AND COALESCE(i.contains_victim, 0) = 0
+        ORDER BY f.image_name, f.person_id, f.face_id;
+    """
+
+    with get_db_connection() as conn:
+        cur = conn.execute(sql, (pattern,))
+        rows = cur.fetchall()
+
+    order: list[str] = []
+    by_image: dict[str, dict] = {}
+    for r in rows:
+        webp = r["image_name"].replace(".jpg", ".webp")
+        if webp not in by_image:
+            if len(order) >= max_images:
+                break
+            by_image[webp] = {
+                "image": webp,
+                "faces": [],
+            }
+            order.append(webp)
+        pid = r["person_id"]
+        by_image[webp]["faces"].append(
+            {
+                "face_id": r["face_id"],
+                "person_id": pid,
+                "left": float(r["left"]),
+                "top": float(r["top"]),
+                "width": float(r["width"]),
+                "height": float(r["height"]),
+            }
+        )
+
+    return [by_image[k] for k in order]
+
+
 def network_person_id_to_name() -> dict[str, str | None]:
     """
     person_id -> display name for people included in the network (include_in_network = 1).
@@ -157,16 +235,42 @@ def get_network_people_names():
 @cache.cached(timeout=14400, query_string=True)
 def get_photos_by_people():
     """
-    Query: person_ids — comma-separated list, e.g. /photos?person_ids=person_1,person_2
-    Returns images where every listed person appears on the same image (at least one face each).
+    Query (one of):
+
+    - person_ids — comma-separated list, e.g. /photos?person_ids=person_1,person_2
+      Returns images where every listed person appears on the same image (at least one face each).
+
+    - document_prefix — stem prefix, e.g. /photos?document_prefix=EFTA00000005
+      Returns images whose filename starts with that prefix (e.g. EFTA00000005-00001.webp).
+
     Each element is {"image": "<file>.webp", "faces": [ {...}, ... ]} — one object per face
     row in the DB for that image (including multiple appearances of the same person).
+
+    Mutually exclusive: pass **either** ``document_prefix`` **or** ``person_ids``, not both.
     """
+    doc_raw = request.args.get("document_prefix", "").strip()
     raw = request.args.get("person_ids", "").strip()
+
+    if doc_raw and raw:
+        return jsonify(
+            error="Bad Request",
+            message="Use either document_prefix or person_ids, not both.",
+        ), 400
+
+    if doc_raw:
+        normalized = _validate_document_prefix(doc_raw)
+        if normalized is None:
+            return jsonify(
+                error="Bad Request",
+                message="Invalid document_prefix: must be EFTA followed by exactly 8 digits (e.g. EFTA00000005).",
+            ), 400
+        data = photos_for_document_prefix(normalized)
+        return jsonify(data=data)
+
     if not raw:
         return jsonify(
             error="Bad Request",
-            message="Missing person_ids query parameter (comma-separated).",
+            message="Missing query: pass person_ids (comma-separated) or document_prefix (not both).",
         ), 400
 
     person_ids = [p.strip() for p in raw.split(",") if p.strip()]
