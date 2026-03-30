@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 _DEFAULT_SQLITE = Path(__file__).resolve().parent.parent / "network"/ "scripts" / "faces.db"
 SQLITE_PATH = os.environ.get("EPSTEIN_SQLITE_PATH", str(_DEFAULT_SQLITE))
 
+# Public URL prefix for best-face crops (13__optimize_node_faces.sh output); no trailing slash.
+BEST_FACE_IMAGE_BASE = os.environ.get(
+    "BEST_FACE_IMAGE_BASE", "/faces"
+)
+
 cache = Cache(
     config={"CACHE_TYPE": "flask_caching.backends.filesystem", "CACHE_DIR": "/tmp"}
 )
@@ -206,6 +211,77 @@ def photos_for_document_prefix(prefix: str) -> list[dict]:
     return [by_image[k] for k in order]
 
 
+def _sanitize_label_for_filename(label: str) -> str:
+    """Match ``scripts/12__export_node_faces.py`` filename stems."""
+    s = "".join(c if c.isalnum() or c in "._- " else "" for c in label)
+    return s.strip().replace(" ", "_").replace("/", "_") or "node"
+
+
+def faces_list() -> list[dict]:
+    """
+    Network members only (``include_in_network = 1``), excluding victims (``is_victim = 0``),
+    with photo counts and optional best-face image URL.
+
+    Sort: (1) has ``best_face_id``, (2) has non-empty ``name``, (3) ``photo_count`` (desc),
+    then ``person_id``.
+    """
+    sql = """
+        SELECT
+            p.person_id,
+            p.name,
+            p.best_face_id,
+            (
+                SELECT COUNT(DISTINCT f.image_name)
+                FROM faces AS f
+                INNER JOIN images AS i ON i.image_name = f.image_name
+                WHERE f.person_id = p.person_id
+                    AND i.duplicate_of IS NULL
+                    AND COALESCE(i.is_explicit, 0) = 0
+                    AND COALESCE(i.contains_victim, 0) = 0
+            ) AS photo_count
+        FROM people AS p
+        WHERE p.include_in_network = 1
+            AND COALESCE(p.is_victim, 0) = 0
+        ORDER BY
+            CASE
+                WHEN p.best_face_id IS NOT NULL AND TRIM(COALESCE(p.best_face_id, '')) != ''
+                THEN 1 ELSE 0
+            END DESC,
+            CASE
+                WHEN p.name IS NOT NULL AND TRIM(COALESCE(p.name, '')) != ''
+                THEN 1 ELSE 0
+            END DESC,
+            photo_count DESC,
+            p.person_id
+    """
+    with get_db_connection() as conn:
+        rows = conn.execute(sql).fetchall()
+
+    base = BEST_FACE_IMAGE_BASE.rstrip("/")
+    out: list[dict] = []
+    for r in rows:
+        pid = r["person_id"]
+        name = r["name"]
+        bf = r["best_face_id"]
+        label = (name or "").strip() or pid
+        safe = _sanitize_label_for_filename(label)
+        image_url: str | None = None
+        if bf is not None and str(bf).strip():
+            image_url = f"{base}/{safe}_{str(bf).strip()}.webp"
+        name_out: str | None = None
+        if name is not None and str(name).strip():
+            name_out = str(name).strip()
+        out.append(
+            {
+                "person_id": pid,
+                "image": image_url,
+                "photo_count": int(r["photo_count"]),
+                "name": name_out,
+            }
+        )
+    return out
+
+
 def network_person_id_to_name() -> dict[str, str | None]:
     """
     person_id -> display name for people included in the network (include_in_network = 1).
@@ -229,6 +305,19 @@ def get_network_people_names():
     """JSON object mapping person_id to display name (network members only)."""
     data = network_person_id_to_name()
     return jsonify(data=data)
+
+
+@app.route("/faces")
+@cache.cached(timeout=14400)
+def get_faces():
+    """
+    List of people with ``person_id``, ``image`` (best-face WebP URL or null),
+    ``photo_count`` (distinct images in the public API sense), and ``name`` (or null).
+
+    Only ``include_in_network = 1`` and non-victim rows. Order: best_face set, has name,
+    higher ``photo_count``, then ``person_id``.
+    """
+    return jsonify(data=faces_list())
 
 
 @app.route("/photos")
