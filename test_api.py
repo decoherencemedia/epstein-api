@@ -19,8 +19,8 @@ def test_photos_single(client):
     body = response.json
     assert body["limit"] == 1000
     assert body["offset"] == 0
-    assert len(body["data"]) == 338
-    assert body["total"] == 338
+    assert len(body["data"]) == 340
+    assert body["total"] == 340
     assert "EFTA00254398-00069.webp" in [image["image"] for image in body["data"]]
 
 def test_photos_double(client):
