@@ -4,6 +4,8 @@ from api import (
     app,
 )
 
+IMAGE_COUNT = 351
+
 @pytest.fixture(scope="module")
 def client():
     with app.test_client() as client:
@@ -19,8 +21,8 @@ def test_photos_single(client):
     body = response.json
     assert body["limit"] == 1000
     assert body["offset"] == 0
-    assert len(body["data"]) == 340
-    assert body["total"] == 340
+    assert len(body["data"]) == IMAGE_COUNT
+    assert body["total"] == IMAGE_COUNT
     assert "EFTA00254398-00069.webp" in [image["image"] for image in body["data"]]
 
 def test_photos_double(client):

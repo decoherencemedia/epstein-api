@@ -113,6 +113,10 @@ def photos_for_all_person_ids(
     ``site/pages/people-inner.html``.
 
     Paginates distinct ``image_name`` values; returns ``(page_items, total_count)``.
+
+    ``people.valid_distinct_image_count`` is not used here: this path must list *which* images
+    qualify (with multi-person intersection when ``len(person_ids) > 1``). Per-person totals do
+    not determine the qualifying set.
     """
     unique = sorted(set(p for p in person_ids if p and str(p).strip()))
     n = len(unique)
@@ -297,8 +301,8 @@ def faces_list() -> list[dict]:
     Network members only (``include_in_network = 1``), excluding victims (``is_victim = 0``),
     with photo counts and optional best-face image URL.
 
-    ``photo_count`` is one aggregated pass over ``faces`` + ``images`` (``LEFT JOIN``), not a
-    per-row correlated subquery.
+    ``photo_count`` comes from ``people.valid_distinct_image_count`` (recomputed by pipeline;
+    same definition as the former aggregate over ``faces`` + ``images``).
 
     Sort: (1) has ``best_face_id``, (2) has non-empty ``name``, (3) ``photo_count`` (desc),
     then ``person_id``.
@@ -308,17 +312,8 @@ def faces_list() -> list[dict]:
             p.person_id,
             p.name,
             p.best_face_id,
-            COALESCE(pc.cnt, 0) AS photo_count
+            p.valid_distinct_image_count AS photo_count
         FROM people AS p
-        LEFT JOIN (
-            SELECT f.person_id AS pid, COUNT(DISTINCT f.image_name) AS cnt
-            FROM faces AS f
-            INNER JOIN images AS i ON i.image_name = f.image_name
-            WHERE i.duplicate_of IS NULL
-                AND COALESCE(i.is_explicit, 0) = 0
-                AND COALESCE(i.contains_victim, 0) = 0
-            GROUP BY f.person_id
-        ) AS pc ON pc.pid = p.person_id
         WHERE p.include_in_network = 1
             AND COALESCE(p.is_victim, 0) = 0
         ORDER BY
