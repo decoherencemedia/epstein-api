@@ -26,6 +26,10 @@ BEST_FACE_IMAGE_BASE = os.environ.get(
 # Distinct images per /photos response page (default limit; also the maximum allowed limit).
 PHOTO_PAGE_SIZE = 1000
 
+# Materialized (person_id, image_name) pairs for API-eligible images; built by
+# epstein-pipeline/scripts/pipeline/update_materialized_content.py
+PERSON_ELIGIBLE_IMAGES_TABLE = "person_eligible_images"
+
 cache = Cache(
     config={"CACHE_TYPE": "flask_caching.backends.filesystem", "CACHE_DIR": "/tmp/flask"}
 )
@@ -92,6 +96,20 @@ def get_db_connection():
     finally:
         conn.close()
 
+
+def _require_person_eligible_images_table(conn: sqlite3.Connection) -> None:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (PERSON_ELIGIBLE_IMAGES_TABLE,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(
+            f"Missing table {PERSON_ELIGIBLE_IMAGES_TABLE!r}. Run "
+            "epstein-pipeline/scripts/pipeline/update_materialized_content.py "
+            "against this database."
+        )
+
+
 @app.route("/")
 def description():
     return {
@@ -114,71 +132,60 @@ def photos_for_all_person_ids(
 
     Paginates distinct ``image_name`` values; returns ``(page_items, total_count)``.
 
-    ``people.valid_distinct_image_count`` is not used here: this path must list *which* images
-    qualify (with multi-person intersection when ``len(person_ids) > 1``). Per-person totals do
-    not determine the qualifying set.
+    Qualifying image names come from the ``PERSON_ELIGIBLE_IMAGES_TABLE`` materialization
+    (rebuilt by the pipeline), using intersection across selected people when
+    ``len(person_ids) > 1``.
     """
     unique = sorted(set(p for p in person_ids if p and str(p).strip()))
     n = len(unique)
     if n == 0:
         return [], 0
 
-    placeholders_in = ",".join("?" * n)
-    qualifying_sql = f"""
-        WITH qualifying AS (
-            SELECT f.image_name
+    pei = PERSON_ELIGIBLE_IMAGES_TABLE
+    branch = f"SELECT image_name FROM {pei} WHERE person_id = ?"
+
+    with get_db_connection() as conn:
+        _require_person_eligible_images_table(conn)
+
+        if n == 1:
+            pid = unique[0]
+            count_sql = f"SELECT COUNT(*) AS c FROM {pei} WHERE person_id = ?"
+            names_sql = (
+                f"SELECT image_name FROM {pei} WHERE person_id = ? "
+                "ORDER BY image_name LIMIT ? OFFSET ?"
+            )
+            total = int(conn.execute(count_sql, (pid,)).fetchone()["c"])
+            name_rows = conn.execute(names_sql, (pid, limit, offset)).fetchall()
+        else:
+            intersect_body = " INTERSECT ".join([branch] * n)
+            count_sql = f"WITH q AS ({intersect_body}) SELECT COUNT(*) AS c FROM q"
+            names_sql = (
+                f"WITH q AS ({intersect_body}) "
+                f"SELECT image_name FROM q ORDER BY image_name LIMIT ? OFFSET ?"
+            )
+            params = tuple(unique)
+            total = int(conn.execute(count_sql, params).fetchone()["c"])
+            name_rows = conn.execute(names_sql, params + (limit, offset)).fetchall()
+
+        names = [r["image_name"] for r in name_rows]
+        if not names:
+            return [], total
+
+        placeholders_names = ",".join("?" * len(names))
+        faces_sql = f"""
+            SELECT
+                f.image_name,
+                f.face_id,
+                f.person_id,
+                f.left,
+                f.top,
+                f.width,
+                f.height
             FROM faces AS f
-            INNER JOIN images AS i ON i.image_name = f.image_name
-            WHERE f.person_id IN ({placeholders_in})
-                AND i.duplicate_of IS NULL
-                AND COALESCE(i.is_explicit, 0) = 0
-                AND COALESCE(i.contains_victim, 0) = 0
-            GROUP BY f.image_name
-            HAVING COUNT(DISTINCT f.person_id) = ?
-        )
-    """
-    base_params = tuple(unique) + (n,)
-
-    count_sql = qualifying_sql + " SELECT COUNT(*) AS c FROM qualifying"
-    names_sql = (
-        qualifying_sql
-        + """
-        SELECT q.image_name
-        FROM qualifying AS q
-        ORDER BY q.image_name
-        LIMIT ? OFFSET ?;
-    """
-    )
-
-    with get_db_connection() as conn:
-        total = int(conn.execute(count_sql, base_params).fetchone()["c"])
-        name_rows = conn.execute(names_sql, base_params + (limit, offset)).fetchall()
-
-    names = [r["image_name"] for r in name_rows]
-    if not names:
-        return [], total
-
-    placeholders_names = ",".join("?" * len(names))
-    faces_sql = f"""
-        SELECT
-            f.image_name,
-            f.face_id,
-            f.person_id,
-            f.left,
-            f.top,
-            f.width,
-            f.height
-        FROM faces AS f
-        INNER JOIN images AS i ON i.image_name = f.image_name
-        WHERE f.image_name IN ({placeholders_names})
-            AND f.person_id IS NOT NULL
-            AND TRIM(f.person_id) != ''
-            AND i.duplicate_of IS NULL
-            AND COALESCE(i.is_explicit, 0) = 0
-            AND COALESCE(i.contains_victim, 0) = 0
-        ORDER BY f.image_name, f.person_id, f.face_id;
-    """
-    with get_db_connection() as conn:
+            WHERE f.image_name IN ({placeholders_names})
+                AND f.is_eligible = 1
+            ORDER BY f.image_name, f.person_id, f.face_id;
+        """
         rows = conn.execute(faces_sql, tuple(names)).fetchall()
 
     return _aggregate_faces_ordered(rows, names), total
@@ -236,18 +243,13 @@ def photos_for_document_prefix(
 
     base_from = """
         FROM faces AS f
-        INNER JOIN images AS i ON i.image_name = f.image_name
         WHERE f.image_name LIKE ?
             AND (
                 f.image_name LIKE 'EFTA%'
                 OR f.image_name LIKE 'BIRTHDAY_BOOK_%'
                 OR f.image_name LIKE 'HOUSE_OVERSIGHT_%'
             )
-            AND f.person_id IS NOT NULL
-            AND TRIM(f.person_id) != ''
-            AND i.duplicate_of IS NULL
-            AND COALESCE(i.is_explicit, 0) = 0
-            AND COALESCE(i.contains_victim, 0) = 0
+            AND f.is_eligible = 1
     """
     count_sql = "SELECT COUNT(DISTINCT f.image_name) AS c " + base_from
     names_sql = (
@@ -260,31 +262,25 @@ def photos_for_document_prefix(
         total = int(conn.execute(count_sql, (pattern,)).fetchone()["c"])
         name_rows = conn.execute(names_sql, (pattern, limit, offset)).fetchall()
 
-    names = [r["image_name"] for r in name_rows]
-    if not names:
-        return [], total
+        names = [r["image_name"] for r in name_rows]
+        if not names:
+            return [], total
 
-    placeholders = ",".join("?" * len(names))
-    faces_sql = f"""
-        SELECT
-            f.image_name,
-            f.face_id,
-            f.person_id,
-            f.left,
-            f.top,
-            f.width,
-            f.height
-        FROM faces AS f
-        INNER JOIN images AS i ON i.image_name = f.image_name
-        WHERE f.image_name IN ({placeholders})
-            AND f.person_id IS NOT NULL
-            AND TRIM(f.person_id) != ''
-            AND i.duplicate_of IS NULL
-            AND COALESCE(i.is_explicit, 0) = 0
-            AND COALESCE(i.contains_victim, 0) = 0
-        ORDER BY f.image_name, f.person_id, f.face_id;
-    """
-    with get_db_connection() as conn:
+        placeholders = ",".join("?" * len(names))
+        faces_sql = f"""
+            SELECT
+                f.image_name,
+                f.face_id,
+                f.person_id,
+                f.left,
+                f.top,
+                f.width,
+                f.height
+            FROM faces AS f
+            WHERE f.image_name IN ({placeholders})
+                AND f.is_eligible = 1
+            ORDER BY f.image_name, f.person_id, f.face_id;
+        """
         rows = conn.execute(faces_sql, tuple(names)).fetchall()
 
     return _aggregate_faces_ordered(rows, names), total
