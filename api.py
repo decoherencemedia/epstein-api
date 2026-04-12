@@ -1,10 +1,11 @@
+import hashlib
 import logging
 import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 from flask_caching import Cache
 from flask_cors import CORS
 
@@ -14,7 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Default: ../faces.db (umbrella network/ next to epstein-api/ and epstein-pipeline/). Override with EPSTEIN_SQLITE_PATH.
+# Default: ../faces_prod.db (API slice from ``update_materialized_content``). Production uses
+# ``run.sh``: downloads ``DB_URL`` into ``EPSTEIN_SQLITE_PATH``. Override with EPSTEIN_SQLITE_PATH.
 _DEFAULT_SQLITE = Path(__file__).resolve().parent.parent / "faces.db"
 SQLITE_PATH = os.environ.get("EPSTEIN_SQLITE_PATH", str(_DEFAULT_SQLITE))
 
@@ -110,6 +112,207 @@ def _require_person_eligible_images_table(conn: sqlite3.Connection) -> None:
         )
 
 
+def _normalize_photo_name_for_db(raw: str) -> str | None:
+    """
+    Map a ``photo`` query value to ``image_name`` as stored (always ``*.jpg`` in SQLite).
+
+    The site may pass ``*.webp``; normalize to the DB basename with ``.jpg``.
+    """
+    s = raw.strip().replace("\\", "/").split("/")[-1].strip()
+    if not s:
+        return None
+    lower = s.lower()
+    if lower.endswith(".webp"):
+        base = s[:-5]
+        if not base:
+            return None
+        return base + ".jpg"
+    if lower.endswith(".jpeg"):
+        base = s[:-5]
+        if not base:
+            return None
+        return base + ".jpg"
+    if lower.endswith(".jpg"):
+        return s
+    return s
+
+
+def _photo_rank_in_person_list(
+    conn: sqlite3.Connection, unique: list[str], target_db_name: str
+) -> int | None:
+    """0-based rank in ``ORDER BY image_name``, or ``None`` if ``target_db_name`` is not in the set."""
+    pei = PERSON_ELIGIBLE_IMAGES_TABLE
+    n = len(unique)
+    branch = f"SELECT image_name FROM {pei} WHERE person_id = ?"
+    if n == 1:
+        pid = unique[0]
+        row = conn.execute(
+            f"SELECT 1 FROM {pei} WHERE person_id = ? AND image_name = ? LIMIT 1",
+            (pid, target_db_name),
+        ).fetchone()
+        if not row:
+            return None
+        r = conn.execute(
+            f"SELECT COUNT(*) AS c FROM {pei} WHERE person_id = ? AND image_name < ?",
+            (pid, target_db_name),
+        ).fetchone()
+        return int(r["c"])
+    intersect_body = " INTERSECT ".join([branch] * n)
+    exists_sql = (
+        f"WITH q AS ({intersect_body}) SELECT 1 AS o FROM q WHERE image_name = ? LIMIT 1"
+    )
+    row = conn.execute(exists_sql, tuple(unique) + (target_db_name,)).fetchone()
+    if not row:
+        return None
+    count_sql = (
+        f"WITH q AS ({intersect_body}) SELECT COUNT(*) AS c FROM q WHERE image_name < ?"
+    )
+    r = conn.execute(count_sql, tuple(unique) + (target_db_name,)).fetchone()
+    return int(r["c"])
+
+
+def _document_faces_base_from() -> str:
+    return """
+        FROM faces AS f
+        WHERE f.image_name LIKE ?
+            AND (
+                f.image_name LIKE 'EFTA%'
+                OR f.image_name LIKE 'BIRTHDAY_BOOK_%'
+                OR f.image_name LIKE 'HOUSE_OVERSIGHT_%'
+            )
+            AND f.is_eligible = 1
+    """
+
+
+def _photo_rank_in_document_prefix(
+    conn: sqlite3.Connection, pattern: str, target_db_name: str
+) -> int | None:
+    """0-based rank among distinct ``image_name`` values for the document-prefix query, or ``None``."""
+    base_from = _document_faces_base_from()
+    exists_sql = (
+        "SELECT 1 FROM (SELECT DISTINCT f.image_name AS image_name "
+        + base_from
+        + ") AS u WHERE u.image_name = ? LIMIT 1"
+    )
+    row = conn.execute(exists_sql, (pattern, target_db_name)).fetchone()
+    if not row:
+        return None
+    count_sql = (
+        "SELECT COUNT(*) AS c FROM (SELECT DISTINCT f.image_name AS image_name "
+        + base_from
+        + " AND f.image_name < ?) AS t"
+    )
+    r = conn.execute(count_sql, (pattern, target_db_name)).fetchone()
+    return int(r["c"])
+
+
+def resolve_effective_photo_offset(
+    photo_raw: str | None,
+    limit: int,
+    request_offset: int,
+    *,
+    person_ids: list[str] | None = None,
+    document_prefix_norm: str | None = None,
+) -> int:
+    """
+    If ``photo`` is set and names a qualifying image, return the page offset (bucket start)
+    that contains it. Otherwise return ``request_offset`` (clamped to non-negative).
+    """
+    req = max(0, request_offset)
+    if not photo_raw or not str(photo_raw).strip():
+        return req
+    target = _normalize_photo_name_for_db(str(photo_raw))
+    if not target:
+        return req
+    with get_db_connection() as conn:
+        if person_ids is not None:
+            unique = sorted(set(p for p in person_ids if p and str(p).strip()))
+            if not unique:
+                return req
+            try:
+                _require_person_eligible_images_table(conn)
+            except RuntimeError:
+                return req
+            rank = _photo_rank_in_person_list(conn, unique, target)
+        elif document_prefix_norm is not None:
+            pattern = document_prefix_norm + "%"
+            rank = _photo_rank_in_document_prefix(conn, pattern, target)
+        else:
+            return req
+    if rank is None:
+        return req
+    return (rank // limit) * limit
+
+
+def _get_photos_limit_and_effective_offset() -> tuple[int, int]:
+    """
+    Parse request args and return ``(limit, effective_offset)`` for the /photos query.
+
+    Raises ``ValueError`` with a client-facing message on bad requests (including pagination).
+    """
+    limit, req_off = _parse_pagination_args()
+    doc_raw = request.args.get("document_prefix", "").strip()
+    raw = request.args.get("person_ids", "").strip()
+    photo_raw = request.args.get("photo", "").strip()
+    if doc_raw and raw:
+        raise ValueError(
+            "Use either document_prefix or person_ids, not both."
+        )
+    if doc_raw:
+        normalized = _normalize_document_prefix(doc_raw)
+        if normalized is None:
+            raise ValueError(
+                "Invalid document_prefix: use a prefix of EFTA, BIRTHDAY_BOOK_, or HOUSE_OVERSIGHT_ "
+                "followed by digits (case-insensitive), e.g. EFTA00000005 or house_oversight_001."
+            )
+        eff = resolve_effective_photo_offset(
+            photo_raw, limit, req_off, document_prefix_norm=normalized
+        )
+        return limit, eff
+    if not raw:
+        raise ValueError(
+            "Missing query: pass person_ids (comma-separated) or document_prefix (not both)."
+        )
+    person_ids = [p.strip() for p in raw.split(",") if p.strip()]
+    if not person_ids:
+        raise ValueError("person_ids must contain at least one id.")
+    eff = resolve_effective_photo_offset(
+        photo_raw, limit, req_off, person_ids=person_ids
+    )
+    return limit, eff
+
+
+def make_photos_cache_key() -> str:
+    """
+    Cache key depends only on resolved pagination (``person_ids`` or ``document_prefix`` +
+    ``limit`` + effective offset), not on raw ``photo``, so ``?photo=`` and ``?offset=`` that
+    resolve to the same page share an entry.
+    """
+    try:
+        limit, eff = _get_photos_limit_and_effective_offset()
+    except ValueError:
+        return f"photos/e/{hashlib.md5(request.query_string.encode()).hexdigest()}"
+
+    g.photos_limit = limit
+    g.photos_effective_offset = eff
+    doc_raw = request.args.get("document_prefix", "").strip()
+    if doc_raw:
+        normalized = _normalize_document_prefix(doc_raw)
+        assert normalized is not None
+        return f"v1/photos/doc/{normalized}/{limit}/{eff}"
+    raw = request.args.get("person_ids", "").strip()
+    person_ids = sorted([p.strip() for p in raw.split(",") if p.strip()])
+    key_ids = ",".join(person_ids)
+    return f"v1/photos/ppl/{key_ids}/{limit}/{eff}"
+
+
+def _photos_cache_only_ok(rv: object) -> bool:
+    if isinstance(rv, tuple) and len(rv) >= 2:
+        return rv[1] == 200
+    sc = getattr(rv, "status_code", 200)
+    return sc == 200
+
+
 @app.route("/")
 def description():
     return {
@@ -128,7 +331,7 @@ def photos_for_all_person_ids(
         {"face_id": str, "person_id": str, "left", "top", "width", "height"}
 
     Coordinates are Rekognition-normalized (0..1). Matches ``normalizeFaceEntries`` in
-    ``site/pages/people-inner.html``.
+    ``site/pages/search-inner.html``.
 
     Paginates distinct ``image_name`` values; returns ``(page_items, total_count)``.
 
@@ -391,7 +594,11 @@ def get_faces():
 
 
 @app.route("/photos")
-@cache.cached(timeout=14400, query_string=True)
+@cache.cached(
+    timeout=14400,
+    make_cache_key=make_photos_cache_key,
+    response_filter=_photos_cache_only_ok,
+)
 def get_photos_by_people():
     """
     Query (one of):
@@ -407,21 +614,27 @@ def get_photos_by_people():
     row in the DB for that image (including multiple appearances of the same person).
 
     Optional pagination: ``limit`` (defaults to ``PHOTO_PAGE_SIZE``, cannot exceed it) and
-    ``offset`` (default 0) apply to
-    distinct images. The response includes ``total`` (full match count), ``limit``, and ``offset``.
+    ``offset`` (default 0) apply to distinct images. The response includes ``total`` (full match
+    count), ``limit``, and ``offset`` (the effective offset used for this page).
+
+    Optional ``photo`` — filename (or basename) of an image in the result set. When set, and the
+    image qualifies for the query, pagination is adjusted so the returned page is the chunk
+    (by ``limit``) that contains that image. If the image is not in the set, ``offset`` from the
+    request is used (default 0). ``photo`` takes precedence over ``offset`` when the image is
+    found.
 
     Mutually exclusive: pass **either** ``document_prefix`` **or** ``person_ids``, not both.
     """
-    limit, offset = _parse_pagination_args()
+    try:
+        if hasattr(g, "photos_effective_offset"):
+            limit, offset = g.photos_limit, g.photos_effective_offset
+        else:
+            limit, offset = _get_photos_limit_and_effective_offset()
+    except ValueError as e:
+        return jsonify(error="Bad Request", message=str(e)), 400
+
     doc_raw = request.args.get("document_prefix", "").strip()
     raw = request.args.get("person_ids", "").strip()
-
-    if doc_raw and raw:
-        return jsonify(
-            error="Bad Request",
-            message="Use either document_prefix or person_ids, not both.",
-        ), 400
-
     if doc_raw:
         normalized = _normalize_document_prefix(doc_raw)
         if normalized is None:
@@ -435,19 +648,7 @@ def get_photos_by_people():
         data, total = photos_for_document_prefix(normalized, limit=limit, offset=offset)
         return jsonify(data=data, total=total, limit=limit, offset=offset)
 
-    if not raw:
-        return jsonify(
-            error="Bad Request",
-            message="Missing query: pass person_ids (comma-separated) or document_prefix (not both).",
-        ), 400
-
     person_ids = [p.strip() for p in raw.split(",") if p.strip()]
-    if not person_ids:
-        return jsonify(
-            error="Bad Request",
-            message="person_ids must contain at least one id.",
-        ), 400
-
     data, total = photos_for_all_person_ids(person_ids, limit=limit, offset=offset)
     return jsonify(data=data, total=total, limit=limit, offset=offset)
 
