@@ -70,6 +70,7 @@ def _aggregate_faces_ordered(rows: list[sqlite3.Row], image_names_order: list[st
             raise RuntimeError(
                 f"Face row image_name not in page list: {r['image_name']!r}"
             )
+        ignored = bool(r["ignored"])
         by_webp[webp]["faces"].append(
             {
                 "face_id": r["face_id"],
@@ -78,6 +79,7 @@ def _aggregate_faces_ordered(rows: list[sqlite3.Row], image_names_order: list[st
                 "top": float(r["top"]),
                 "width": float(r["width"]),
                 "height": float(r["height"]),
+                "ignored": ignored,
             }
         )
     out: list[dict] = []
@@ -299,11 +301,11 @@ def make_photos_cache_key() -> str:
     if doc_raw:
         normalized = _normalize_document_prefix(doc_raw)
         assert normalized is not None
-        return f"v1/photos/doc/{normalized}/{limit}/{eff}"
+        return f"v2/photos/doc/{normalized}/{limit}/{eff}"
     raw = request.args.get("person_ids", "").strip()
     person_ids = sorted([p.strip() for p in raw.split(",") if p.strip()])
     key_ids = ",".join(person_ids)
-    return f"v1/photos/ppl/{key_ids}/{limit}/{eff}"
+    return f"v2/photos/ppl/{key_ids}/{limit}/{eff}"
 
 
 def _photos_cache_only_ok(rv: object) -> bool:
@@ -383,8 +385,10 @@ def photos_for_all_person_ids(
                 f.left,
                 f.top,
                 f.width,
-                f.height
+                f.height,
+                CASE WHEN COALESCE(p.include_in_network, 0) = -1 THEN 1 ELSE 0 END AS ignored
             FROM faces AS f
+            LEFT JOIN people AS p ON p.person_id = f.person_id
             WHERE f.image_name IN ({placeholders_names})
                 AND f.is_eligible = 1
             ORDER BY f.image_name, f.person_id, f.face_id;
@@ -478,8 +482,10 @@ def photos_for_document_prefix(
                 f.left,
                 f.top,
                 f.width,
-                f.height
+                f.height,
+                CASE WHEN COALESCE(p.include_in_network, 0) = -1 THEN 1 ELSE 0 END AS ignored
             FROM faces AS f
+            LEFT JOIN people AS p ON p.person_id = f.person_id
             WHERE f.image_name IN ({placeholders})
                 AND f.is_eligible = 1
             ORDER BY f.image_name, f.person_id, f.face_id;
