@@ -91,6 +91,13 @@ def _aggregate_faces_ordered(rows: list[sqlite3.Row], image_names_order: list[st
     return out
 
 
+def _clean_optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s if s else None
+
+
 @contextmanager
 def get_db_connection():
     conn = sqlite3.connect(SQLITE_PATH)
@@ -398,6 +405,38 @@ def photos_for_all_person_ids(
     return _aggregate_faces_ordered(rows, names), total
 
 
+def person_metadata_for_person_id(person_id: str) -> dict | None:
+    """
+    Return metadata for one person_id from ``people``, or ``None`` when not found.
+
+    Used by ``/photos`` when exactly one person_id is searched so UI can render
+    single-person context links without additional API round-trips.
+    """
+    pid = str(person_id or "").strip()
+    if not pid:
+        return None
+    with get_db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT person_id, name, link, jmail_link, reference_image_url
+            FROM people
+            WHERE person_id = ?
+            LIMIT 1
+            """,
+            (pid,),
+        ).fetchone()
+    if row is None:
+        return None
+
+    return {
+        "person_id": str(row["person_id"]),
+        "name": _clean_optional_text(row["name"]),
+        "link": _clean_optional_text(row["link"]),
+        "jmail_link": _clean_optional_text(row["jmail_link"]),
+        "reference_image_url": _clean_optional_text(row["reference_image_url"]),
+    }
+
+
 DOCUMENT_ID_PREFIXES = ("EFTA", "BIRTHDAY_BOOK_", "HOUSE_OVERSIGHT_")
 
 
@@ -656,7 +695,11 @@ def get_photos_by_people():
 
     person_ids = [p.strip() for p in raw.split(",") if p.strip()]
     data, total = photos_for_all_person_ids(person_ids, limit=limit, offset=offset)
-    return jsonify(data=data, total=total, limit=limit, offset=offset)
+    out = {"data": data, "total": total, "limit": limit, "offset": offset}
+    unique_person_ids = sorted(set(person_ids))
+    if len(unique_person_ids) == 1:
+        out["person_metadata"] = person_metadata_for_person_id(unique_person_ids[0])
+    return jsonify(out)
 
 
 def start():
