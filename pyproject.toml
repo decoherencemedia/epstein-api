@@ -16,6 +16,7 @@ dev = [
     "pytest-cov",
     "pytest-html",
     "ruff~=0.15.11",
+    "ty",
 ]
 
 [tool.uv]

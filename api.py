@@ -317,7 +317,7 @@ def make_photos_cache_key() -> str:
     try:
         limit, eff = _get_photos_limit_and_effective_offset()
     except ValueError:
-        return f"photos/e/{hashlib.md5(request.query_string.encode()).hexdigest()}"
+        return f"photos/e/{hashlib.md5(request.query_string).hexdigest()}"
 
     g.photos_limit = limit
     g.photos_effective_offset = eff
