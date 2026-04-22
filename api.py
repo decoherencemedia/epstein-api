@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -58,7 +59,12 @@ def _parse_pagination_args() -> tuple[int, int]:
     return limit, offset
 
 
-def _aggregate_faces_ordered(rows: list[sqlite3.Row], image_names_order: list[str]) -> list[dict]:
+def _aggregate_faces_ordered(
+    rows: list[sqlite3.Row],
+    image_names_order: list[str],
+    *,
+    google_drive_key_by_jpg: dict[str, str | None] | None = None,
+) -> list[dict]:
     """Build photo items in ``image_names_order`` (DB ``image_name`` values, typically .jpg)."""
     order_webp = [n.replace(".jpg", ".webp") for n in image_names_order]
     by_webp: dict[str, dict] = {}
@@ -87,8 +93,53 @@ def _aggregate_faces_ordered(rows: list[sqlite3.Row], image_names_order: list[st
         item = by_webp[w]
         if not item["faces"]:
             raise RuntimeError(f"No face rows aggregated for ordered image {w!r}")
-        out.append(item)
+        payload: dict = {"image": w, "faces": item["faces"]}
+        if google_drive_key_by_jpg is not None:
+            jpg = w.replace(".webp", ".jpg")
+            payload["google_drive_key"] = _clean_optional_text(
+                google_drive_key_by_jpg.get(jpg)
+            )
+        out.append(payload)
     return out
+
+
+def _google_drive_keys_for_image_names(
+    conn: sqlite3.Connection, image_names: list[str]
+) -> dict[str, str | None]:
+    """Return ``image_name`` (as in DB, typically ``*.jpg``) -> optional Drive file id.
+
+    Keys come from ``person_eligible_images.google_drive_key`` (pipeline DB and prod slice), filled
+    by ``rebuild_person_eligible_images`` from ``images`` when ``has_face = 1``.
+    """
+    if not image_names:
+        return {}
+    cols = [
+        row[1]
+        for row in conn.execute(
+            "PRAGMA table_info(person_eligible_images)"
+        ).fetchall()
+    ]
+    if not cols:
+        raise RuntimeError(
+            "person_eligible_images is missing or unreadable; run pipeline materialization."
+        )
+    if "google_drive_key" not in cols:
+        raise RuntimeError(
+            "person_eligible_images.google_drive_key column missing; run "
+            "epstein-pipeline/scripts/pipeline/update_materialized_content.py "
+            "(rebuild_person_eligible_images) against this SQLite file."
+        )
+    placeholders = ",".join("?" * len(image_names))
+    q = f"""
+        SELECT image_name, MAX(google_drive_key) AS google_drive_key
+        FROM person_eligible_images
+        WHERE image_name IN ({placeholders})
+        GROUP BY image_name
+    """
+    found: dict[str, str | None] = dict.fromkeys(image_names)
+    for r in conn.execute(q, tuple(image_names)).fetchall():
+        found[str(r["image_name"])] = _clean_optional_text(r["google_drive_key"])
+    return found
 
 
 def _clean_optional_text(value: object) -> str | None:
@@ -272,7 +323,8 @@ def _get_photos_limit_and_effective_offset() -> tuple[int, int]:
         if normalized is None:
             raise ValueError(
                 "Invalid document_prefix: use a prefix of EFTA, BIRTHDAY_BOOK_, or HOUSE_OVERSIGHT_ "
-                "followed by digits (case-insensitive), e.g. EFTA00000005 or house_oversight_001."
+                "followed by digits (case-insensitive). Extensions and hyphens in pasted file names "
+                "are stripped, e.g. EFTA00000005, EFTA00000005.pdf, EFTA00000005-00006.webp."
             )
         eff = resolve_effective_photo_offset(
             photo_raw, limit, req_off, document_prefix_norm=normalized
@@ -401,8 +453,11 @@ def photos_for_all_person_ids(
             ORDER BY f.image_name, f.person_id, f.face_id;
         """
         rows = conn.execute(faces_sql, tuple(names)).fetchall()
+        drive = _google_drive_keys_for_image_names(conn, names)
 
-    return _aggregate_faces_ordered(rows, names), total
+    return _aggregate_faces_ordered(
+        rows, names, google_drive_key_by_jpg=drive
+    ), total
 
 
 def person_metadata_for_person_id(person_id: str) -> dict | None:
@@ -440,6 +495,42 @@ def person_metadata_for_person_id(person_id: str) -> dict | None:
 DOCUMENT_ID_PREFIXES = ("EFTA", "BIRTHDAY_BOOK_", "HOUSE_OVERSIGHT_")
 
 
+def _strip_document_search_term(raw: str) -> str:
+    """
+    Same rules as ``SiteShared.stripDocumentSearchTerm``: remove extensions, hyphens, and periods
+    used in pasted file names so ``LIKE prefix%`` matches DB ``image_name`` stems.
+    """
+    t = raw.strip()
+    if not t:
+        return ""
+    u = t.upper()
+    for p in DOCUMENT_ID_PREFIXES:
+        if u.startswith(p):
+            rest = u[len(p) :]
+            rest = re.sub(r"\.[A-Za-z]*$", "", rest)
+            rest = re.sub(r"[-.]", "", rest)
+            return p + rest
+    u = re.sub(r"\.(PDF|WEBP|JPEG|JPG)$", "", u, flags=re.IGNORECASE)
+    u = re.sub(r"[-.]", "", u)
+    return u
+
+
+def _is_valid_partial_document_query_normalized(u: str) -> bool:
+    t = u.strip()
+    if not t:
+        return True
+    up = t.upper()
+    for p in DOCUMENT_ID_PREFIXES:
+        if p.startswith(up):
+            return True
+        if up.startswith(p):
+            rest = up[len(p) :]
+            if rest == "" or rest.isdigit():
+                return True
+            return False
+    return False
+
+
 def is_valid_partial_document_query(s: str) -> bool:
     """
     True if ``s`` is empty, or could still become ``PREFIX`` + digits for one of
@@ -447,6 +538,9 @@ def is_valid_partial_document_query(s: str) -> bool:
     """
     t = s.strip()
     if not t:
+        return True
+    st = _strip_document_search_term(t)
+    if _is_valid_partial_document_query_normalized(st):
         return True
     u = t.upper()
     for p in DOCUMENT_ID_PREFIXES:
@@ -456,20 +550,22 @@ def is_valid_partial_document_query(s: str) -> bool:
             rest = u[len(p) :]
             if rest == "" or rest.isdigit():
                 return True
+            if re.fullmatch(r"(\d+)(-\d+)*(\.[A-Z]{0,4})?", rest):
+                return True
             return False
     return False
 
 
 def _normalize_document_prefix(raw: str) -> str | None:
     """
-    Non-empty, valid partial query → uppercase stem for ``LIKE prefix%``.
+    Non-empty, valid query → uppercase stem for ``LIKE prefix%`` (extensions / hyphens / periods stripped).
     """
-    p = raw.strip()
+    p = _strip_document_search_term(raw)
     if not p:
         return None
-    if not is_valid_partial_document_query(p):
+    if not _is_valid_partial_document_query_normalized(p):
         return None
-    return p.upper()
+    return p
 
 
 def photos_for_document_prefix(
@@ -530,8 +626,11 @@ def photos_for_document_prefix(
             ORDER BY f.image_name, f.person_id, f.face_id;
         """
         rows = conn.execute(faces_sql, tuple(names)).fetchall()
+        drive = _google_drive_keys_for_image_names(conn, names)
 
-    return _aggregate_faces_ordered(rows, names), total
+    return _aggregate_faces_ordered(
+        rows, names, google_drive_key_by_jpg=drive
+    ), total
 
 
 def _sanitize_label_for_filename(label: str) -> str:
@@ -687,7 +786,8 @@ def get_photos_by_people():
                 error="Bad Request",
                 message=(
                     "Invalid document_prefix: use a prefix of EFTA, BIRTHDAY_BOOK_, or HOUSE_OVERSIGHT_ "
-                    "followed by digits (case-insensitive), e.g. EFTA00000005 or house_oversight_001."
+                    "followed by digits (case-insensitive). Extensions and hyphens in pasted file names "
+                    "are stripped, e.g. EFTA00000005, EFTA00000005.pdf, EFTA00000005-00006.webp."
                 ),
             ), 400
         data, total = photos_for_document_prefix(normalized, limit=limit, offset=offset)
