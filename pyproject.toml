@@ -15,6 +15,7 @@ dev = [
     "pytest-flask",
     "pytest-cov",
     "pytest-html",
+    "ruff~=0.15.11",
 ]
 
 [tool.uv]
@@ -24,3 +25,14 @@ default-groups = "all"
 [[tool.uv.index]]
 name = "pypi"
 url = "https://pypi.org/simple"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RET", "PTH"]
+ignore = [
+    "SIM103",  # `if cond: return True; return False` -> `return cond` (hurts readability)
+    "SIM108",  # if/else -> ternary (hurts readability)
+]

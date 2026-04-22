@@ -22,9 +22,7 @@ _DEFAULT_SQLITE = Path(__file__).resolve().parent.parent / "faces.db"
 SQLITE_PATH = os.environ.get("EPSTEIN_SQLITE_PATH", str(_DEFAULT_SQLITE))
 
 # Public URL prefix for best-face crops (13__optimize_node_faces.sh output); no trailing slash.
-BEST_FACE_IMAGE_BASE = os.environ.get(
-    "BEST_FACE_IMAGE_BASE", "/faces"
-)
+BEST_FACE_IMAGE_BASE = os.environ.get("BEST_FACE_IMAGE_BASE", "/faces")
 
 # Distinct images per /photos response page (default limit; also the maximum allowed limit).
 PHOTO_PAGE_SIZE = 1000
@@ -33,9 +31,7 @@ PHOTO_PAGE_SIZE = 1000
 # epstein-pipeline/scripts/pipeline/update_materialized_content.py
 PERSON_ELIGIBLE_IMAGES_TABLE = "person_eligible_images"
 
-cache = Cache(
-    config={"CACHE_TYPE": "flask_caching.backends.filesystem", "CACHE_DIR": "/tmp/flask"}
-)
+cache = Cache(config={"CACHE_TYPE": "flask_caching.backends.filesystem", "CACHE_DIR": "/tmp/flask"})
 
 
 app = Flask(__name__)
@@ -51,9 +47,7 @@ def _parse_pagination_args() -> tuple[int, int]:
     limit = int(limit_raw)
     offset = int(offset_raw)
     if limit < 1 or limit > PHOTO_PAGE_SIZE:
-        raise ValueError(
-            f"limit must be between 1 and {PHOTO_PAGE_SIZE} inclusive, got {limit!r}"
-        )
+        raise ValueError(f"limit must be between 1 and {PHOTO_PAGE_SIZE} inclusive, got {limit!r}")
     if offset < 0:
         raise ValueError(f"offset must be non-negative, got {offset!r}")
     return limit, offset
@@ -73,9 +67,7 @@ def _aggregate_faces_ordered(
     for r in rows:
         webp = r["image_name"].replace(".jpg", ".webp")
         if webp not in by_webp:
-            raise RuntimeError(
-                f"Face row image_name not in page list: {r['image_name']!r}"
-            )
+            raise RuntimeError(f"Face row image_name not in page list: {r['image_name']!r}")
         ignored = bool(r["ignored"])
         by_webp[webp]["faces"].append(
             {
@@ -96,16 +88,12 @@ def _aggregate_faces_ordered(
         payload: dict = {"image": w, "faces": item["faces"]}
         if google_drive_key_by_jpg is not None:
             jpg = w.replace(".webp", ".jpg")
-            payload["google_drive_key"] = _clean_optional_text(
-                google_drive_key_by_jpg.get(jpg)
-            )
+            payload["google_drive_key"] = _clean_optional_text(google_drive_key_by_jpg.get(jpg))
         out.append(payload)
     return out
 
 
-def _google_drive_keys_for_image_names(
-    conn: sqlite3.Connection, image_names: list[str]
-) -> dict[str, str | None]:
+def _google_drive_keys_for_image_names(conn: sqlite3.Connection, image_names: list[str]) -> dict[str, str | None]:
     """Return ``image_name`` (as in DB, typically ``*.jpg``) -> optional Drive file id.
 
     Keys come from ``person_eligible_images.google_drive_key`` (pipeline DB and prod slice), filled
@@ -113,16 +101,9 @@ def _google_drive_keys_for_image_names(
     """
     if not image_names:
         return {}
-    cols = [
-        row[1]
-        for row in conn.execute(
-            "PRAGMA table_info(person_eligible_images)"
-        ).fetchall()
-    ]
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(person_eligible_images)").fetchall()]
     if not cols:
-        raise RuntimeError(
-            "person_eligible_images is missing or unreadable; run pipeline materialization."
-        )
+        raise RuntimeError("person_eligible_images is missing or unreadable; run pipeline materialization.")
     if "google_drive_key" not in cols:
         raise RuntimeError(
             "person_eligible_images.google_drive_key column missing; run "
@@ -197,9 +178,7 @@ def _normalize_photo_name_for_db(raw: str) -> str | None:
     return s
 
 
-def _photo_rank_in_person_list(
-    conn: sqlite3.Connection, unique: list[str], target_db_name: str
-) -> int | None:
+def _photo_rank_in_person_list(conn: sqlite3.Connection, unique: list[str], target_db_name: str) -> int | None:
     """0-based rank in ``ORDER BY image_name``, or ``None`` if ``target_db_name`` is not in the set."""
     pei = PERSON_ELIGIBLE_IMAGES_TABLE
     n = len(unique)
@@ -218,15 +197,11 @@ def _photo_rank_in_person_list(
         ).fetchone()
         return int(r["c"])
     intersect_body = " INTERSECT ".join([branch] * n)
-    exists_sql = (
-        f"WITH q AS ({intersect_body}) SELECT 1 AS o FROM q WHERE image_name = ? LIMIT 1"
-    )
+    exists_sql = f"WITH q AS ({intersect_body}) SELECT 1 AS o FROM q WHERE image_name = ? LIMIT 1"
     row = conn.execute(exists_sql, tuple(unique) + (target_db_name,)).fetchone()
     if not row:
         return None
-    count_sql = (
-        f"WITH q AS ({intersect_body}) SELECT COUNT(*) AS c FROM q WHERE image_name < ?"
-    )
+    count_sql = f"WITH q AS ({intersect_body}) SELECT COUNT(*) AS c FROM q WHERE image_name < ?"
     r = conn.execute(count_sql, tuple(unique) + (target_db_name,)).fetchone()
     return int(r["c"])
 
@@ -244,9 +219,7 @@ def _document_faces_base_from() -> str:
     """
 
 
-def _photo_rank_in_document_prefix(
-    conn: sqlite3.Connection, pattern: str, target_db_name: str
-) -> int | None:
+def _photo_rank_in_document_prefix(conn: sqlite3.Connection, pattern: str, target_db_name: str) -> int | None:
     """0-based rank among distinct ``image_name`` values for the document-prefix query, or ``None``."""
     base_from = _document_faces_base_from()
     exists_sql = (
@@ -315,9 +288,7 @@ def _get_photos_limit_and_effective_offset() -> tuple[int, int]:
     raw = request.args.get("person_ids", "").strip()
     photo_raw = request.args.get("photo", "").strip()
     if doc_raw and raw:
-        raise ValueError(
-            "Use either document_prefix or person_ids, not both."
-        )
+        raise ValueError("Use either document_prefix or person_ids, not both.")
     if doc_raw:
         normalized = _normalize_document_prefix(doc_raw)
         if normalized is None:
@@ -326,20 +297,14 @@ def _get_photos_limit_and_effective_offset() -> tuple[int, int]:
                 "followed by digits (case-insensitive). Extensions and hyphens in pasted file names "
                 "are stripped, e.g. EFTA00000005, EFTA00000005.pdf, EFTA00000005-00006.webp."
             )
-        eff = resolve_effective_photo_offset(
-            photo_raw, limit, req_off, document_prefix_norm=normalized
-        )
+        eff = resolve_effective_photo_offset(photo_raw, limit, req_off, document_prefix_norm=normalized)
         return limit, eff
     if not raw:
-        raise ValueError(
-            "Missing query: pass person_ids (comma-separated) or document_prefix (not both)."
-        )
+        raise ValueError("Missing query: pass person_ids (comma-separated) or document_prefix (not both).")
     person_ids = [p.strip() for p in raw.split(",") if p.strip()]
     if not person_ids:
         raise ValueError("person_ids must contain at least one id.")
-    eff = resolve_effective_photo_offset(
-        photo_raw, limit, req_off, person_ids=person_ids
-    )
+    eff = resolve_effective_photo_offset(photo_raw, limit, req_off, person_ids=person_ids)
     return limit, eff
 
 
@@ -377,12 +342,14 @@ def _photos_cache_only_ok(rv: object) -> bool:
 @app.route("/")
 def description():
     return {
-        "message": "Welcome to the API of Epstein.Photos, which maps out the network of connections between people in the Epstein Library."
+        "message": (
+            "Welcome to the API of Epstein.Photos, which maps out the network "
+            "of connections between people in the Epstein Library."
+        )
     }
 
-def photos_for_all_person_ids(
-    person_ids: list[str], *, limit: int, offset: int
-) -> tuple[list[dict], int]:
+
+def photos_for_all_person_ids(person_ids: list[str], *, limit: int, offset: int) -> tuple[list[dict], int]:
     """
     Return one object per image: each image contains every requested person_id at least once.
 
@@ -414,19 +381,13 @@ def photos_for_all_person_ids(
         if n == 1:
             pid = unique[0]
             count_sql = f"SELECT COUNT(*) AS c FROM {pei} WHERE person_id = ?"
-            names_sql = (
-                f"SELECT image_name FROM {pei} WHERE person_id = ? "
-                "ORDER BY image_name LIMIT ? OFFSET ?"
-            )
+            names_sql = f"SELECT image_name FROM {pei} WHERE person_id = ? ORDER BY image_name LIMIT ? OFFSET ?"
             total = int(conn.execute(count_sql, (pid,)).fetchone()["c"])
             name_rows = conn.execute(names_sql, (pid, limit, offset)).fetchall()
         else:
             intersect_body = " INTERSECT ".join([branch] * n)
             count_sql = f"WITH q AS ({intersect_body}) SELECT COUNT(*) AS c FROM q"
-            names_sql = (
-                f"WITH q AS ({intersect_body}) "
-                f"SELECT image_name FROM q ORDER BY image_name LIMIT ? OFFSET ?"
-            )
+            names_sql = f"WITH q AS ({intersect_body}) SELECT image_name FROM q ORDER BY image_name LIMIT ? OFFSET ?"
             params = tuple(unique)
             total = int(conn.execute(count_sql, params).fetchone()["c"])
             name_rows = conn.execute(names_sql, params + (limit, offset)).fetchall()
@@ -455,9 +416,7 @@ def photos_for_all_person_ids(
         rows = conn.execute(faces_sql, tuple(names)).fetchall()
         drive = _google_drive_keys_for_image_names(conn, names)
 
-    return _aggregate_faces_ordered(
-        rows, names, google_drive_key_by_jpg=drive
-    ), total
+    return _aggregate_faces_ordered(rows, names, google_drive_key_by_jpg=drive), total
 
 
 def person_metadata_for_person_id(person_id: str) -> dict | None:
@@ -511,8 +470,7 @@ def _strip_document_search_term(raw: str) -> str:
             rest = re.sub(r"[-.]", "", rest)
             return p + rest
     u = re.sub(r"\.(PDF|WEBP|JPEG|JPG)$", "", u, flags=re.IGNORECASE)
-    u = re.sub(r"[-.]", "", u)
-    return u
+    return re.sub(r"[-.]", "", u)
 
 
 def _is_valid_partial_document_query_normalized(u: str) -> bool:
@@ -568,9 +526,7 @@ def _normalize_document_prefix(raw: str) -> str | None:
     return p
 
 
-def photos_for_document_prefix(
-    prefix: str, *, limit: int, offset: int
-) -> tuple[list[dict], int]:
+def photos_for_document_prefix(prefix: str, *, limit: int, offset: int) -> tuple[list[dict], int]:
     """
     Return one object per image whose ``image_name`` starts with ``prefix`` (same filters as
     ``photos_for_all_person_ids``: non-duplicate, non-explicit, no victim images).
@@ -594,11 +550,7 @@ def photos_for_document_prefix(
             AND f.is_eligible = 1
     """
     count_sql = "SELECT COUNT(DISTINCT f.image_name) AS c " + base_from
-    names_sql = (
-        "SELECT DISTINCT f.image_name "
-        + base_from
-        + " ORDER BY f.image_name LIMIT ? OFFSET ?"
-    )
+    names_sql = "SELECT DISTINCT f.image_name " + base_from + " ORDER BY f.image_name LIMIT ? OFFSET ?"
 
     with get_db_connection() as conn:
         total = int(conn.execute(count_sql, (pattern,)).fetchone()["c"])
@@ -628,9 +580,7 @@ def photos_for_document_prefix(
         rows = conn.execute(faces_sql, tuple(names)).fetchall()
         drive = _google_drive_keys_for_image_names(conn, names)
 
-    return _aggregate_faces_ordered(
-        rows, names, google_drive_key_by_jpg=drive
-    ), total
+    return _aggregate_faces_ordered(rows, names, google_drive_key_by_jpg=drive), total
 
 
 def _sanitize_label_for_filename(label: str) -> str:

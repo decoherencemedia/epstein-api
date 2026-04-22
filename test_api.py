@@ -22,21 +22,23 @@ def _person_eligible_images_present() -> bool:
 _PHOTOS_SKIP = pytest.mark.skipif(
     not _person_eligible_images_present(),
     reason=(
-        "Requires person_eligible_images table; run "
-        "epstein-pipeline/scripts/pipeline/update_materialized_content.py"
+        "Requires person_eligible_images table; run epstein-pipeline/scripts/pipeline/update_materialized_content.py"
     ),
 )
 
 IMAGE_COUNT = 361
+
 
 @pytest.fixture(scope="module")
 def client():
     with app.test_client() as client:
         yield client
 
+
 def test_description(client):
     response = client.get("/")
     assert b"Library" in response.data
+
 
 @_PHOTOS_SKIP
 def test_photos_single(client):
@@ -48,6 +50,7 @@ def test_photos_single(client):
     assert len(body["data"]) == IMAGE_COUNT
     assert body["total"] == IMAGE_COUNT
     assert "EFTA00254398-00069.webp" in [image["image"] for image in body["data"]]
+
 
 @_PHOTOS_SKIP
 def test_photos_double(client):
@@ -72,6 +75,7 @@ def test_photos_pagination_offset(client):
     names0 = [x["image"] for x in a["data"]]
     names1 = [x["image"] for x in b["data"]]
     assert set(names0).isdisjoint(names1)
+
 
 def test_people(client):
     response = client.get("/people")
