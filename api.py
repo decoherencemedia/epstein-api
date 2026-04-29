@@ -206,28 +206,71 @@ def _photo_rank_in_person_list(conn: sqlite3.Connection, unique: list[str], targ
     return int(r["c"])
 
 
-def _document_faces_base_from() -> str:
-    return """
-        FROM faces AS f
-        WHERE f.image_name LIKE ?
-            AND (
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _require_images_alias_for_efta_search(conn: sqlite3.Connection) -> None:
+    cols = _table_columns(conn, "images")
+    if not cols:
+        raise RuntimeError("Missing table images (expected on API database for EFTA alias search).")
+    if "alias" not in cols:
+        raise RuntimeError(
+            "images.alias column missing (rebuild faces_prod.db / run pipeline export after add_efta_alias.py)."
+        )
+
+
+def _document_faces_from_where(*, match_efta_alias: bool) -> str:
+    """
+    Shared FROM/WHERE for document-prefix queries over eligible faces.
+
+    For EFTA prefixes, also match ``images.alias`` (slim table in ``faces_prod.db``), which enables
+    searching synthesized IDs like ``EFTA00250540`` for a page image ``EFTA00250488-00052.jpg``.
+
+    Join is on ``images.image_name`` (PK) and is guarded to EFTA-only prefixes so other document
+    families keep the old fast path.
+    """
+    family_clause = """
+            (
                 f.image_name LIKE 'EFTA%'
                 OR f.image_name LIKE 'BIRTHDAY_BOOK_%'
                 OR f.image_name LIKE 'HOUSE_OVERSIGHT_%'
             )
-            AND f.is_eligible = 1
+    """
+    if match_efta_alias:
+        return f"""
+        FROM faces AS f
+        LEFT JOIN images AS i ON i.image_name = f.image_name
+        WHERE f.is_eligible = 1
+            AND {family_clause}
+            AND (
+                f.image_name LIKE ?
+                OR (i.alias IS NOT NULL AND i.alias LIKE ?)
+            )
+        """
+    return f"""
+        FROM faces AS f
+        WHERE f.is_eligible = 1
+            AND {family_clause}
+            AND f.image_name LIKE ?
     """
 
 
 def _photo_rank_in_document_prefix(conn: sqlite3.Connection, pattern: str, target_db_name: str) -> int | None:
     """0-based rank among distinct ``image_name`` values for the document-prefix query, or ``None``."""
-    base_from = _document_faces_base_from()
+    match_efta_alias = pattern.upper().startswith("EFTA")
+    if match_efta_alias:
+        _require_images_alias_for_efta_search(conn)
+    base_from = _document_faces_from_where(match_efta_alias=match_efta_alias)
     exists_sql = (
         "SELECT 1 FROM (SELECT DISTINCT f.image_name AS image_name "
         + base_from
         + ") AS u WHERE u.image_name = ? LIMIT 1"
     )
-    row = conn.execute(exists_sql, (pattern, target_db_name)).fetchone()
+    if match_efta_alias:
+        row = conn.execute(exists_sql, (pattern, pattern, target_db_name)).fetchone()
+    else:
+        row = conn.execute(exists_sql, (pattern, target_db_name)).fetchone()
     if not row:
         return None
     count_sql = (
@@ -235,7 +278,10 @@ def _photo_rank_in_document_prefix(conn: sqlite3.Connection, pattern: str, targe
         + base_from
         + " AND f.image_name < ?) AS t"
     )
-    r = conn.execute(count_sql, (pattern, target_db_name)).fetchone()
+    if match_efta_alias:
+        r = conn.execute(count_sql, (pattern, pattern, target_db_name)).fetchone()
+    else:
+        r = conn.execute(count_sql, (pattern, target_db_name)).fetchone()
     return int(r["c"])
 
 
@@ -538,23 +584,20 @@ def photos_for_document_prefix(prefix: str, *, limit: int, offset: int) -> tuple
         return [], 0
 
     pattern = unique_prefix + "%"
+    match_efta_alias = unique_prefix.startswith("EFTA")
 
-    base_from = """
-        FROM faces AS f
-        WHERE f.image_name LIKE ?
-            AND (
-                f.image_name LIKE 'EFTA%'
-                OR f.image_name LIKE 'BIRTHDAY_BOOK_%'
-                OR f.image_name LIKE 'HOUSE_OVERSIGHT_%'
-            )
-            AND f.is_eligible = 1
-    """
+    base_from = _document_faces_from_where(match_efta_alias=match_efta_alias)
     count_sql = "SELECT COUNT(DISTINCT f.image_name) AS c " + base_from
     names_sql = "SELECT DISTINCT f.image_name " + base_from + " ORDER BY f.image_name LIMIT ? OFFSET ?"
 
     with get_db_connection() as conn:
-        total = int(conn.execute(count_sql, (pattern,)).fetchone()["c"])
-        name_rows = conn.execute(names_sql, (pattern, limit, offset)).fetchall()
+        if match_efta_alias:
+            _require_images_alias_for_efta_search(conn)
+            total = int(conn.execute(count_sql, (pattern, pattern)).fetchone()["c"])
+            name_rows = conn.execute(names_sql, (pattern, pattern, limit, offset)).fetchall()
+        else:
+            total = int(conn.execute(count_sql, (pattern,)).fetchone()["c"])
+            name_rows = conn.execute(names_sql, (pattern, limit, offset)).fetchall()
 
         names = [r["image_name"] for r in name_rows]
         if not names:

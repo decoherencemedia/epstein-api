@@ -26,7 +26,7 @@ _PHOTOS_SKIP = pytest.mark.skipif(
     ),
 )
 
-IMAGE_COUNT = 361
+IMAGE_COUNT = 364
 
 
 @pytest.fixture(scope="module")
