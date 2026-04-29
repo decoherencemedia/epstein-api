@@ -101,3 +101,20 @@ def test_faces_empty_classes(client):
     r = client.get("/faces?classes=")
     assert r.status_code == 200
     assert r.json["data"] == []
+
+
+def test_faces_pagination_offset(client):
+    r0 = client.get("/faces?limit=5&offset=0")
+    r1 = client.get("/faces?limit=5&offset=5")
+    assert r0.status_code == 200 and r1.status_code == 200
+    a = r0.json
+    b = r1.json
+    assert a["limit"] == 5 and b["limit"] == 5
+    assert a["offset"] == 0 and b["offset"] == 5
+    assert isinstance(a["total"], int) and isinstance(b["total"], int)
+    assert a["total"] == b["total"]
+    assert len(a["data"]) == 5
+    assert len(b["data"]) == 5
+    ids0 = [x["person_id"] for x in a["data"]]
+    ids1 = [x["person_id"] for x in b["data"]]
+    assert set(ids0).isdisjoint(ids1)

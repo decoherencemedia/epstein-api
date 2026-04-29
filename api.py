@@ -34,6 +34,7 @@ PERSON_ELIGIBLE_IMAGES_TABLE = "person_eligible_images"
 # GET /faces: include people by class (sheet ``people.include_in_network`` + name presence).
 FACE_CLASSES_DEFAULT = ("named", "unknown")
 FACE_CLASSES_ALLOWED = frozenset({"named", "unknown", "ignored", "unidentified"})
+FACES_PAGE_SIZE = 1000
 
 cache = Cache(config={"CACHE_TYPE": "flask_caching.backends.filesystem", "CACHE_DIR": "/tmp/flask"})
 
@@ -52,6 +53,18 @@ def _parse_pagination_args() -> tuple[int, int]:
     offset = int(offset_raw)
     if limit < 1 or limit > PHOTO_PAGE_SIZE:
         raise ValueError(f"limit must be between 1 and {PHOTO_PAGE_SIZE} inclusive, got {limit!r}")
+    if offset < 0:
+        raise ValueError(f"offset must be non-negative, got {offset!r}")
+    return limit, offset
+
+
+def _parse_faces_pagination_args() -> tuple[int, int]:
+    limit_raw = request.args.get("limit", str(FACES_PAGE_SIZE))
+    offset_raw = request.args.get("offset", "0")
+    limit = int(limit_raw)
+    offset = int(offset_raw)
+    if limit < 1 or limit > FACES_PAGE_SIZE:
+        raise ValueError(f"limit must be between 1 and {FACES_PAGE_SIZE} inclusive, got {limit!r}")
     if offset < 0:
         raise ValueError(f"offset must be non-negative, got {offset!r}")
     return limit, offset
@@ -648,8 +661,7 @@ def parse_face_classes_query(raw: str) -> list[str]:
     unknown_tokens = [p for p in parts if p not in FACE_CLASSES_ALLOWED]
     if unknown_tokens:
         raise ValueError(
-            f"Invalid classes token(s): {unknown_tokens!r}. "
-            f"Allowed: {', '.join(sorted(FACE_CLASSES_ALLOWED))}."
+            f"Invalid classes token(s): {unknown_tokens!r}. Allowed: {', '.join(sorted(FACE_CLASSES_ALLOWED))}."
         )
     return sorted(set(parts))
 
@@ -677,13 +689,9 @@ def _faces_class_where_fragment(classes: list[str]) -> str:
     parts: list[str] = []
     cs = set(classes)
     if "named" in cs:
-        parts.append(
-            "(COALESCE(p.include_in_network, 0) = 1 AND TRIM(COALESCE(p.name, '')) != '')"
-        )
+        parts.append("(COALESCE(p.include_in_network, 0) = 1 AND TRIM(COALESCE(p.name, '')) != '')")
     if "unknown" in cs:
-        parts.append(
-            "(COALESCE(p.include_in_network, 0) = 1 AND TRIM(COALESCE(p.name, '')) = '')"
-        )
+        parts.append("(COALESCE(p.include_in_network, 0) = 1 AND TRIM(COALESCE(p.name, '')) = '')")
     if "ignored" in cs:
         parts.append("(COALESCE(p.include_in_network, 0) = -1)")
     if "unidentified" in cs:
@@ -693,7 +701,9 @@ def _faces_class_where_fragment(classes: list[str]) -> str:
     return "(" + " OR ".join(parts) + ")"
 
 
-def faces_list(classes: list[str] | None = None) -> list[dict]:
+def faces_list(
+    classes: list[str] | None = None, *, limit: int = FACES_PAGE_SIZE, offset: int = 0
+) -> tuple[list[dict], int]:
     """
     People rows for the People gallery, with photo counts and optional best-face image URL.
 
@@ -728,9 +738,17 @@ def faces_list(classes: list[str] | None = None) -> list[dict]:
             END DESC,
             photo_count DESC,
             p.person_id
+        LIMIT ? OFFSET ?
+    """
+    count_sql = f"""
+        SELECT COUNT(*) AS c
+        FROM people AS p
+        WHERE COALESCE(p.is_victim, 0) = 0
+            AND {class_sql}
     """
     with get_db_connection() as conn:
-        rows = conn.execute(sql).fetchall()
+        total = int(conn.execute(count_sql).fetchone()["c"])
+        rows = conn.execute(sql, (limit, offset)).fetchall()
 
     base = BEST_FACE_IMAGE_BASE.rstrip("/")
     out: list[dict] = []
@@ -754,7 +772,7 @@ def faces_list(classes: list[str] | None = None) -> list[dict]:
                 "name": name_out,
             }
         )
-    return out
+    return out, total
 
 
 def network_person_id_to_name() -> dict[str, str | None]:
@@ -783,14 +801,18 @@ def get_network_people_names():
 
 
 def make_faces_cache_key() -> str:
-    """Cache ``GET /faces`` per normalized ``classes`` query (default = named + unknown)."""
+    """Cache ``GET /faces`` per normalized ``classes`` + pagination args."""
     try:
         cls = resolve_face_classes_from_request()
     except ValueError:
         return "v2/faces/__invalid__"
+    try:
+        limit, offset = _parse_faces_pagination_args()
+    except ValueError:
+        return "v2/faces/__invalid_pagination__"
     if not cls:
-        return "v2/faces/__empty__"
-    return "v2/faces/" + ",".join(cls)
+        return f"v2/faces/__empty__/{limit}/{offset}"
+    return "v2/faces/" + ",".join(cls) + f"/{limit}/{offset}"
 
 
 @app.route("/faces")
@@ -804,13 +826,17 @@ def get_faces():
     ``named``, ``unknown``, ``ignored``, ``unidentified``. Default: ``named,unknown``
     (in-network with and without names). Adding classes **widens** the result set versus default.
 
+    Optional pagination: ``limit`` (default ``FACES_PAGE_SIZE``; max same) and ``offset`` (default 0).
+
     Order: best_face set, has name, higher ``photo_count``, then ``person_id``.
     """
     try:
         classes = resolve_face_classes_from_request()
+        limit, offset = _parse_faces_pagination_args()
     except ValueError as e:
         return jsonify(error="Bad Request", message=str(e)), 400
-    return jsonify(data=faces_list(classes))
+    data, total = faces_list(classes, limit=limit, offset=offset)
+    return jsonify(data=data, total=total, limit=limit, offset=offset)
 
 
 @app.route("/photos")
