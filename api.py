@@ -31,6 +31,10 @@ PHOTO_PAGE_SIZE = 1000
 # epstein-pipeline/scripts/pipeline/update_materialized_content.py
 PERSON_ELIGIBLE_IMAGES_TABLE = "person_eligible_images"
 
+# GET /faces: include people by class (sheet ``people.include_in_network`` + name presence).
+FACE_CLASSES_DEFAULT = ("named", "unknown")
+FACE_CLASSES_ALLOWED = frozenset({"named", "unknown", "ignored", "unidentified"})
+
 cache = Cache(config={"CACHE_TYPE": "flask_caching.backends.filesystem", "CACHE_DIR": "/tmp/flask"})
 
 
@@ -632,26 +636,87 @@ def _sanitize_label_for_filename(label: str) -> str:
     return s.strip().replace(" ", "_").replace("/", "_") or "node"
 
 
-def faces_list() -> list[dict]:
+def parse_face_classes_query(raw: str) -> list[str]:
     """
-    Network members only (``include_in_network = 1``), excluding victims (``is_victim = 0``),
-    with photo counts and optional best-face image URL.
+    Parse a non-empty ``classes`` query value for ``GET /faces``.
 
-    ``photo_count`` comes from ``people.valid_distinct_image_count`` (recomputed by pipeline;
-    same definition as the former aggregate over ``faces`` + ``images``).
+    Comma-separated tokens: ``named``, ``unknown``, ``ignored``, ``unidentified``.
+    """
+    parts = [p.strip().lower() for p in str(raw).split(",") if p.strip()]
+    if not parts:
+        raise ValueError("classes must list at least one token when non-empty.")
+    unknown_tokens = [p for p in parts if p not in FACE_CLASSES_ALLOWED]
+    if unknown_tokens:
+        raise ValueError(
+            f"Invalid classes token(s): {unknown_tokens!r}. "
+            f"Allowed: {', '.join(sorted(FACE_CLASSES_ALLOWED))}."
+        )
+    return sorted(set(parts))
+
+
+def resolve_face_classes_from_request() -> list[str]:
+    """
+    Classes list for ``GET /faces``.
+
+    - Parameter **absent** → default ``named`` + ``unknown`` (historical /people behavior).
+    - ``classes=`` present but empty → **no** classes (empty result set).
+    - Otherwise parse comma-separated tokens.
+    """
+    if "classes" not in request.args:
+        return list(FACE_CLASSES_DEFAULT)
+    raw = request.args.get("classes", "")
+    if not str(raw).strip():
+        return []
+    return parse_face_classes_query(raw)
+
+
+def _faces_class_where_fragment(classes: list[str]) -> str:
+    """Return ``( ... OR ... )`` SQL for the selected class tokens."""
+    if not classes:
+        return "(1 = 0)"
+    parts: list[str] = []
+    cs = set(classes)
+    if "named" in cs:
+        parts.append(
+            "(COALESCE(p.include_in_network, 0) = 1 AND TRIM(COALESCE(p.name, '')) != '')"
+        )
+    if "unknown" in cs:
+        parts.append(
+            "(COALESCE(p.include_in_network, 0) = 1 AND TRIM(COALESCE(p.name, '')) = '')"
+        )
+    if "ignored" in cs:
+        parts.append("(COALESCE(p.include_in_network, 0) = -1)")
+    if "unidentified" in cs:
+        parts.append("(COALESCE(p.include_in_network, 0) = 0)")
+    if not parts:
+        return "(1 = 0)"
+    return "(" + " OR ".join(parts) + ")"
+
+
+def faces_list(classes: list[str] | None = None) -> list[dict]:
+    """
+    People rows for the People gallery, with photo counts and optional best-face image URL.
+
+    ``classes`` selects which ``people.include_in_network`` + name buckets to include
+    (see ``parse_face_classes_query``). Victims (``is_victim = 1``) are always excluded.
+
+    ``photo_count`` comes from ``people.valid_distinct_image_count`` (recomputed by pipeline).
 
     Sort: (1) has ``best_face_id``, (2) has non-empty ``name``, (3) ``photo_count`` (desc),
     then ``person_id``.
     """
-    sql = """
+    if classes is None:
+        classes = list(FACE_CLASSES_DEFAULT)
+    class_sql = _faces_class_where_fragment(classes)
+    sql = f"""
         SELECT
             p.person_id,
             p.name,
             p.best_face_id,
             p.valid_distinct_image_count AS photo_count
         FROM people AS p
-        WHERE p.include_in_network = 1
-            AND COALESCE(p.is_victim, 0) = 0
+        WHERE COALESCE(p.is_victim, 0) = 0
+            AND {class_sql}
         ORDER BY
             CASE
                 WHEN p.best_face_id IS NOT NULL AND TRIM(COALESCE(p.best_face_id, '')) != ''
@@ -717,17 +782,35 @@ def get_network_people_names():
     return jsonify(data=data)
 
 
+def make_faces_cache_key() -> str:
+    """Cache ``GET /faces`` per normalized ``classes`` query (default = named + unknown)."""
+    try:
+        cls = resolve_face_classes_from_request()
+    except ValueError:
+        return "v2/faces/__invalid__"
+    if not cls:
+        return "v2/faces/__empty__"
+    return "v2/faces/" + ",".join(cls)
+
+
 @app.route("/faces")
-@cache.cached(timeout=14400)
+@cache.cached(timeout=14400, make_cache_key=make_faces_cache_key)
 def get_faces():
     """
     List of people with ``person_id``, ``image`` (best-face WebP URL or null),
     ``photo_count`` (distinct images in the public API sense), and ``name`` (or null).
 
-    Only ``include_in_network = 1`` and non-victim rows. Order: best_face set, has name,
-    higher ``photo_count``, then ``person_id``.
+    Non-victim rows only.     Optional query: ``classes`` — comma-separated list of which groups to **include**
+    ``named``, ``unknown``, ``ignored``, ``unidentified``. Default: ``named,unknown``
+    (in-network with and without names). Adding classes **widens** the result set versus default.
+
+    Order: best_face set, has name, higher ``photo_count``, then ``person_id``.
     """
-    return jsonify(data=faces_list())
+    try:
+        classes = resolve_face_classes_from_request()
+    except ValueError as e:
+        return jsonify(error="Bad Request", message=str(e)), 400
+    return jsonify(data=faces_list(classes))
 
 
 @app.route("/photos")

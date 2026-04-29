@@ -81,3 +81,23 @@ def test_people(client):
     response = client.get("/people")
     assert response.status_code == 200
     assert response.json["data"]["person_49"] == "Jean-Luc Brunel"
+
+
+def test_faces_default_matches_named_unknown_explicit(client):
+    """Omitting ``classes`` defaults to named + unknown — same as ``?classes=named,unknown``."""
+    r0 = client.get("/faces")
+    r1 = client.get("/faces?classes=named,unknown")
+    assert r0.status_code == 200 and r1.status_code == 200
+    assert r0.json["data"] == r1.json["data"]
+
+
+def test_faces_invalid_classes(client):
+    r = client.get("/faces?classes=named,invalid_token")
+    assert r.status_code == 400
+    assert "Invalid classes token" in r.json["message"]
+
+
+def test_faces_empty_classes(client):
+    r = client.get("/faces?classes=")
+    assert r.status_code == 200
+    assert r.json["data"] == []
