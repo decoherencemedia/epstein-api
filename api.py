@@ -486,6 +486,9 @@ def person_metadata_for_person_id(person_id: str) -> dict | None:
     """
     Return metadata for one person_id from ``people``, or ``None`` when not found.
 
+    Victims (``is_victim = 1``) never get metadata — same as not found — so the UI does not
+    expose links or reference URLs for anonymized victim pages.
+
     Used by ``/photos`` when exactly one person_id is searched so UI can render
     single-person context links without additional API round-trips.
     """
@@ -498,6 +501,7 @@ def person_metadata_for_person_id(person_id: str) -> dict | None:
             SELECT person_id, name, link, jmail_link, reference_image_url
             FROM people
             WHERE person_id = ?
+              AND COALESCE(is_victim, 0) = 0
             LIMIT 1
             """,
             (pid,),

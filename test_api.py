@@ -5,7 +5,19 @@ import pytest
 from api import (
     SQLITE_PATH,
     app,
+    person_metadata_for_person_id,
 )
+
+
+def _first_victim_person_id() -> str | None:
+    conn = sqlite3.connect(SQLITE_PATH)
+    try:
+        row = conn.execute(
+            "SELECT person_id FROM people WHERE COALESCE(is_victim, 0) = 1 LIMIT 1"
+        ).fetchone()
+        return str(row[0]) if row else None
+    finally:
+        conn.close()
 
 
 def _person_eligible_images_present() -> bool:
@@ -24,6 +36,11 @@ _PHOTOS_SKIP = pytest.mark.skipif(
     reason=(
         "Requires person_eligible_images table; run epstein-pipeline/scripts/pipeline/update_materialized_content.py"
     ),
+)
+
+_VICTIM_SKIP = pytest.mark.skipif(
+    _first_victim_person_id() is None,
+    reason="No is_victim=1 row in people",
 )
 
 IMAGE_COUNT = 364
@@ -75,6 +92,22 @@ def test_photos_pagination_offset(client):
     names0 = [x["image"] for x in a["data"]]
     names1 = [x["image"] for x in b["data"]]
     assert set(names0).isdisjoint(names1)
+
+
+@_VICTIM_SKIP
+def test_person_metadata_omits_victims():
+    pid = _first_victim_person_id()
+    assert pid is not None
+    assert person_metadata_for_person_id(pid) is None
+
+
+@_PHOTOS_SKIP
+@_VICTIM_SKIP
+def test_photos_single_victim_has_no_person_metadata(client):
+    pid = _first_victim_person_id()
+    response = client.get(f"/photos?person_ids={pid}")
+    assert response.status_code == 200
+    assert response.json.get("person_metadata") is None
 
 
 def test_people(client):
