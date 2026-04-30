@@ -731,6 +731,17 @@ def faces_list(
         FROM people AS p
         WHERE COALESCE(p.is_victim, 0) = 0
             AND {class_sql}
+            AND EXISTS (
+                SELECT 1
+                FROM faces AS f
+                WHERE f.person_id = p.person_id
+                  AND f.is_eligible = 1
+                  AND NOT (
+                    f.age_range_low IS NOT NULL
+                    AND f.age_range_high IS NOT NULL
+                    AND (f.age_range_low < 18 OR f.age_range_high < 18)
+                  )
+            )
         ORDER BY
             CASE
                 WHEN p.best_face_id IS NOT NULL AND TRIM(COALESCE(p.best_face_id, '')) != ''
@@ -749,6 +760,17 @@ def faces_list(
         FROM people AS p
         WHERE COALESCE(p.is_victim, 0) = 0
             AND {class_sql}
+            AND EXISTS (
+                SELECT 1
+                FROM faces AS f
+                WHERE f.person_id = p.person_id
+                  AND f.is_eligible = 1
+                  AND NOT (
+                    f.age_range_low IS NOT NULL
+                    AND f.age_range_high IS NOT NULL
+                    AND (f.age_range_low < 18 OR f.age_range_high < 18)
+                  )
+            )
     """
     with get_db_connection() as conn:
         total = int(conn.execute(count_sql).fetchone()["c"])

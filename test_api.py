@@ -31,6 +31,29 @@ def _person_eligible_images_present() -> bool:
         conn.close()
 
 
+def _has_non_minor_eligible_face(person_id: str) -> bool:
+    conn = sqlite3.connect(SQLITE_PATH)
+    try:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM faces
+            WHERE person_id = ?
+              AND is_eligible = 1
+              AND NOT (
+                    age_range_low IS NOT NULL
+                    AND age_range_high IS NOT NULL
+                    AND (age_range_low < 18 OR age_range_high < 18)
+              )
+            LIMIT 1
+            """,
+            (person_id,),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
 _PHOTOS_SKIP = pytest.mark.skipif(
     not _person_eligible_images_present(),
     reason=(
@@ -151,3 +174,12 @@ def test_faces_pagination_offset(client):
     ids0 = [x["person_id"] for x in a["data"]]
     ids1 = [x["person_id"] for x in b["data"]]
     assert set(ids0).isdisjoint(ids1)
+
+
+def test_faces_rows_have_non_minor_eligible_face(client):
+    r = client.get("/faces?classes=named,unknown,ignored,unidentified&limit=1000&offset=0")
+    assert r.status_code == 200
+    rows = r.json["data"]
+    assert rows
+    for row in rows:
+        assert _has_non_minor_eligible_face(str(row["person_id"]))
