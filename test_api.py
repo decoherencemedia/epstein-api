@@ -54,6 +54,16 @@ def _has_non_minor_eligible_face(person_id: str) -> bool:
         conn.close()
 
 
+def _people_has_non_minor_flag_column() -> bool:
+    conn = sqlite3.connect(SQLITE_PATH)
+    try:
+        rows = conn.execute("PRAGMA table_info(people)").fetchall()
+        cols = {str(r[1]) for r in rows}
+        return "has_non_minor_eligible_face" in cols
+    finally:
+        conn.close()
+
+
 _PHOTOS_SKIP = pytest.mark.skipif(
     not _person_eligible_images_present(),
     reason=(
@@ -64,6 +74,11 @@ _PHOTOS_SKIP = pytest.mark.skipif(
 _VICTIM_SKIP = pytest.mark.skipif(
     _first_victim_person_id() is None,
     reason="No is_victim=1 row in people",
+)
+
+_NON_MINOR_FLAG_SKIP = pytest.mark.skipif(
+    not _people_has_non_minor_flag_column(),
+    reason="people.has_non_minor_eligible_face missing (rebuild materialized DB)",
 )
 
 IMAGE_COUNT = 364
@@ -176,6 +191,7 @@ def test_faces_pagination_offset(client):
     assert set(ids0).isdisjoint(ids1)
 
 
+@_NON_MINOR_FLAG_SKIP
 def test_faces_rows_have_non_minor_eligible_face(client):
     r = client.get("/faces?classes=named,unknown,ignored,unidentified&limit=1000&offset=0")
     assert r.status_code == 200

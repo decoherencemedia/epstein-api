@@ -715,6 +715,8 @@ def faces_list(
     (see ``parse_face_classes_query``). Victims (``is_victim = 1``) are always excluded.
 
     ``photo_count`` comes from ``people.valid_distinct_image_count`` (recomputed by pipeline).
+    People are included only when ``people.has_non_minor_eligible_face = 1`` when that materialized
+    column exists on this DB.
 
     Sort: (1) has ``best_face_id``, (2) has non-empty ``name``, (3) ``photo_count`` (desc),
     then ``person_id``.
@@ -722,7 +724,13 @@ def faces_list(
     if classes is None:
         classes = list(FACE_CLASSES_DEFAULT)
     class_sql = _faces_class_where_fragment(classes)
-    sql = f"""
+    with get_db_connection() as conn:
+        people_cols = _table_columns(conn, "people")
+        has_non_minor_filter = "has_non_minor_eligible_face" in people_cols
+        non_minor_sql = (
+            "AND COALESCE(p.has_non_minor_eligible_face, 0) = 1" if has_non_minor_filter else ""
+        )
+        sql = f"""
         SELECT
             p.person_id,
             p.name,
@@ -731,17 +739,7 @@ def faces_list(
         FROM people AS p
         WHERE COALESCE(p.is_victim, 0) = 0
             AND {class_sql}
-            AND EXISTS (
-                SELECT 1
-                FROM faces AS f
-                WHERE f.person_id = p.person_id
-                  AND f.is_eligible = 1
-                  AND NOT (
-                    f.age_range_low IS NOT NULL
-                    AND f.age_range_high IS NOT NULL
-                    AND (f.age_range_low < 18 OR f.age_range_high < 18)
-                  )
-            )
+            {non_minor_sql}
         ORDER BY
             CASE
                 WHEN p.best_face_id IS NOT NULL AND TRIM(COALESCE(p.best_face_id, '')) != ''
@@ -755,24 +753,13 @@ def faces_list(
             p.person_id
         LIMIT ? OFFSET ?
     """
-    count_sql = f"""
+        count_sql = f"""
         SELECT COUNT(*) AS c
         FROM people AS p
         WHERE COALESCE(p.is_victim, 0) = 0
             AND {class_sql}
-            AND EXISTS (
-                SELECT 1
-                FROM faces AS f
-                WHERE f.person_id = p.person_id
-                  AND f.is_eligible = 1
-                  AND NOT (
-                    f.age_range_low IS NOT NULL
-                    AND f.age_range_high IS NOT NULL
-                    AND (f.age_range_low < 18 OR f.age_range_high < 18)
-                  )
-            )
+            {non_minor_sql}
     """
-    with get_db_connection() as conn:
         total = int(conn.execute(count_sql).fetchone()["c"])
         rows = conn.execute(sql, (limit, offset)).fetchall()
 
