@@ -86,6 +86,7 @@ def _aggregate_faces_ordered(
         if webp not in by_webp:
             raise RuntimeError(f"Face row image_name not in page list: {r['image_name']!r}")
         ignored = bool(r["ignored"])
+        inc = int(r["include_in_network"])
         by_webp[webp]["faces"].append(
             {
                 "face_id": r["face_id"],
@@ -95,6 +96,7 @@ def _aggregate_faces_ordered(
                 "width": float(r["width"]),
                 "height": float(r["height"]),
                 "ignored": ignored,
+                "include_in_network": inc,
             }
         )
     out: list[dict] = []
@@ -419,7 +421,11 @@ def photos_for_all_person_ids(person_ids: list[str], *, limit: int, offset: int)
     ``faces`` is a list of every face row in that image (all ``person_id`` values), including
     multiple boxes for the same person when they appear more than once. Each element is::
 
-        {"face_id": str, "person_id": str, "left", "top", "width", "height"}
+        {"face_id": str, "person_id": str, "left", "top", "width", "height",
+         "ignored": bool, "include_in_network": int}
+
+    ``include_in_network`` is ``COALESCE(people.include_in_network, 0)`` (``1`` in-network,
+    ``0`` unidentified, ``-1`` excluded — last also sets ``ignored`` true).
 
     Coordinates are Rekognition-normalized (0..1). Matches ``normalizeFaceEntries`` in
     ``site/pages/search-inner.html``.
@@ -469,7 +475,8 @@ def photos_for_all_person_ids(person_ids: list[str], *, limit: int, offset: int)
                 f.top,
                 f.width,
                 f.height,
-                CASE WHEN COALESCE(p.include_in_network, 0) = -1 THEN 1 ELSE 0 END AS ignored
+                CASE WHEN COALESCE(p.include_in_network, 0) = -1 THEN 1 ELSE 0 END AS ignored,
+                COALESCE(p.include_in_network, 0) AS include_in_network
             FROM faces AS f
             LEFT JOIN people AS p ON p.person_id = f.person_id
             WHERE f.image_name IN ({placeholders_names})
@@ -634,7 +641,8 @@ def photos_for_document_prefix(prefix: str, *, limit: int, offset: int) -> tuple
                 f.top,
                 f.width,
                 f.height,
-                CASE WHEN COALESCE(p.include_in_network, 0) = -1 THEN 1 ELSE 0 END AS ignored
+                CASE WHEN COALESCE(p.include_in_network, 0) = -1 THEN 1 ELSE 0 END AS ignored,
+                COALESCE(p.include_in_network, 0) AS include_in_network
             FROM faces AS f
             LEFT JOIN people AS p ON p.person_id = f.person_id
             WHERE f.image_name IN ({placeholders})
@@ -727,9 +735,7 @@ def faces_list(
     with get_db_connection() as conn:
         people_cols = _table_columns(conn, "people")
         has_non_minor_filter = "has_non_minor_eligible_face" in people_cols
-        non_minor_sql = (
-            "AND COALESCE(p.has_non_minor_eligible_face, 0) = 1" if has_non_minor_filter else ""
-        )
+        non_minor_sql = "AND COALESCE(p.has_non_minor_eligible_face, 0) = 1" if has_non_minor_filter else ""
         sql = f"""
         SELECT
             p.person_id,

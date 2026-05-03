@@ -12,9 +12,7 @@ from api import (
 def _first_victim_person_id() -> str | None:
     conn = sqlite3.connect(SQLITE_PATH)
     try:
-        row = conn.execute(
-            "SELECT person_id FROM people WHERE COALESCE(is_victim, 0) = 1 LIMIT 1"
-        ).fetchone()
+        row = conn.execute("SELECT person_id FROM people WHERE COALESCE(is_victim, 0) = 1 LIMIT 1").fetchone()
         return str(row[0]) if row else None
     finally:
         conn.close()
@@ -81,7 +79,7 @@ _NON_MINOR_FLAG_SKIP = pytest.mark.skipif(
     reason="people.has_non_minor_eligible_face missing (rebuild materialized DB)",
 )
 
-IMAGE_COUNT = 364
+IMAGE_COUNT = 366
 
 
 @pytest.fixture(scope="module")
