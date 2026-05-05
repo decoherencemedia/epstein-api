@@ -1,8 +1,16 @@
-# epstein-api
+# Epstein API
 
-This is a simple API for the Epstein Photos network
+Read-only Flask API for [epstein.photos](https://epstein.photos/) using the slimmed production SQLite database, deployed with Gunicorn. Lives next to `epstein-web` and `epstein-pipeline` repos.
+
+## Routes
+
+- `/photos` — Search photos either by person IDs or document prefix (EFTA / House Oversight stems), with face geometry per image.
+
+- `/faces` — Returns faces and names used in *People* page (name, counts, best-face URL), with optional class filters.Victims and minors omitted.
+
+- `/people` — Mapping of in-network `person_id` to display name.
 
 ## TODO
-- Reduce error response redundancy
-- Document endpoints and parameters
-- Configure testing workflow on DigitalOcean action instead of GitHub action
+
+- Organization could probably be improved
+- More tests
