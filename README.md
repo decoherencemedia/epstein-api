@@ -1,6 +1,8 @@
 # Epstein API
 
-Read-only Flask API for [epstein.photos](https://epstein.photos/) using the slimmed production SQLite database, deployed with Gunicorn. Lives next to `epstein-web` and `epstein-pipeline` repos.
+Read-only Flask API for [Decoherence Media's](https://decoherence.media/) [epstein.photos](https://epstein.photos/) project, using the slimmed production SQLite database, deployed with Gunicorn. Lives next to [`epstein-web`](https://github.com/decoherencemedia/epstein-web) and [`epstein-pipeline`](https://github.com/decoherencemedia/epstein-pipeline) repos.
+
+For more information, read [our guide](https://decoherence.media/we-identified-more-than-400-people-in-photos-from-the-epstein-files/).
 
 ## Routes
 
